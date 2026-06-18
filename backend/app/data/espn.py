@@ -11,6 +11,8 @@ NOT appear here until the draft ends — that is Phase 3's websocket/DOM job.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 
 READ_HOST = "https://lm-api-reads.fantasy.espn.com"
@@ -30,6 +32,14 @@ QB_CAPABLE_SLOTS = {"QB", "OP", "TQB"}
 
 # Reception stat id in ESPN scoring → distinguishes PPR / half / standard.
 RECEPTION_STAT_ID = 53
+
+# ESPN stat-block discriminators (used to pick the right projection).
+STAT_SOURCE_ACTUAL = 0      # statSourceId: real, in-season results
+STAT_SOURCE_PROJECTED = 1   # statSourceId: preseason/in-season projection
+STAT_SPLIT_SEASON = 0       # statSplitTypeId: full-season total (not weekly)
+
+# ESPN defaultPositionId → our position code (offense + D/ST only).
+ESPN_POSITION_BY_ID = {1: "QB", 2: "RB", 3: "WR", 4: "TE", 5: "K", 16: "DEF"}
 
 # ESPN pro-team id -> abbrev (Sleeper convention) for bye-week mapping.
 # Filled from the season endpoint at runtime; this static map is a fallback.
@@ -83,6 +93,90 @@ def fetch_bye_weeks(season: int) -> dict[str, int]:
         if abbrev and bye:
             byes[abbrev] = bye
     return byes
+
+
+def fetch_player_projections(
+    league_id: str, season: int, swid: str | None = None,
+    espn_s2: str | None = None, limit: int = 1500,
+) -> dict:
+    """Fetch the `kona_player_info` view for a league.
+
+    Queried at the LEAGUE endpoint (not the generic players endpoint) on purpose:
+    ESPN computes each projection's `appliedTotal` using THIS league's scoring
+    rules, so PPR / half / standard / superflex are baked in for free — exactly
+    the scoring-format awareness the engine needs. Selection + paging is driven
+    by the `x-fantasy-filter` header, the way ESPN's own client does it.
+    """
+    url = LEAGUE_URL.format(season=season, league_id=league_id)
+    # Sort by projected season points (descending) and take the top `limit`.
+    flt = {
+        "players": {
+            "limit": limit,
+            "offset": 0,
+            "sortAppliedStatTotal": {
+                "sortAsc": False, "sortPriority": 1, "value": None,
+            },
+            "filterStatsForExternalIds": {"value": [season]},
+        }
+    }
+    with _client(swid, espn_s2) as client:
+        resp = client.get(
+            url,
+            params=[("view", "kona_player_info")],
+            headers={"x-fantasy-filter": json.dumps(flt)},
+        )
+        if resp.status_code == 401:
+            raise PermissionError(
+                "ESPN returned 401 — this league is private. Supply ESPN_SWID "
+                "and ESPN_S2 cookies from your logged-in browser session."
+            )
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _projection_total(stats: list[dict], season: int) -> float | None:
+    """Pick the season-total PROJECTION from a player's stat blocks.
+
+    Prefers an exact season match; otherwise accepts any projected season total
+    (handles the preseason window where ESPN may key the projection slightly
+    differently). Returns None if the player has no projection at all.
+    """
+    fallback: float | None = None
+    for s in stats or []:
+        if s.get("statSourceId") != STAT_SOURCE_PROJECTED:
+            continue
+        if s.get("statSplitTypeId") != STAT_SPLIT_SEASON:
+            continue
+        total = s.get("appliedTotal")
+        if total is None:
+            continue
+        if s.get("seasonId") == season:
+            return float(total)
+        fallback = float(total)
+    return fallback
+
+
+def parse_projections(payload: dict, season: int) -> dict[str, dict]:
+    """Map ESPN player id (str) -> {points, position, name} from a
+    kona_player_info payload. Keyed by ESPN id because that is the join key to
+    our Sleeper-sourced players (we store each player's espn_id).
+    """
+    out: dict[str, dict] = {}
+    for item in payload.get("players") or []:
+        # Items wrap the player under "player"; tolerate a flat shape too.
+        player = item.get("player") if isinstance(item.get("player"), dict) else item
+        espn_id = player.get("id") or item.get("id")
+        if espn_id is None:
+            continue
+        points = _projection_total(player.get("stats") or [], season)
+        if points is None:
+            continue
+        out[str(espn_id)] = {
+            "points": round(points, 1),
+            "position": ESPN_POSITION_BY_ID.get(player.get("defaultPositionId")),
+            "name": player.get("fullName"),
+        }
+    return out
 
 
 def _detect_scoring(settings: dict) -> tuple[str, float]:

@@ -82,6 +82,48 @@ def load_players(conn: sqlite3.Connection, force: bool = False) -> dict:
             "kept_fantasy": kept, "bye_weeks_loaded": len(byes)}
 
 
+def load_projections(
+    conn: sqlite3.Connection, league_id: str, season: int,
+    swid: str | None = None, espn_s2: str | None = None,
+) -> dict:
+    """Pull real season projections from ESPN (kona_player_info, league-scored)
+    and write them onto the players we already have, joined by espn_id.
+
+    Players we can't match (no espn_id, or absent from ESPN's list) keep
+    proj_source NULL and fall back to the rank-based placeholder in the engine.
+    """
+    payload = espn.fetch_player_projections(league_id, season, swid=swid, espn_s2=espn_s2)
+    projections = espn.parse_projections(payload, season)
+    if not projections:
+        return {"espn_players": 0, "matched": 0, "unmatched": 0}
+
+    now = _now()
+    # Build espn_id -> player_id from our table (one ESPN id maps to one player).
+    id_rows = conn.execute(
+        "SELECT player_id, espn_id FROM players WHERE espn_id IS NOT NULL"
+    ).fetchall()
+    pid_by_espn = {r["espn_id"]: r["player_id"] for r in id_rows}
+
+    matched = 0
+    updates = []
+    for espn_id, proj in projections.items():
+        pid = pid_by_espn.get(espn_id)
+        if pid is None:
+            continue
+        matched += 1
+        updates.append((proj["points"], "espn", now, pid))
+    conn.executemany(
+        "UPDATE players SET proj_points=?, proj_source=?, proj_updated_at=? "
+        "WHERE player_id=?",
+        updates,
+    )
+    db.set_meta(conn, "espn_projections_last_refresh", now)
+    db.set_meta(conn, "espn_projections_season", str(season))
+    conn.commit()
+    return {"espn_players": len(projections), "matched": matched,
+            "unmatched": len(projections) - matched}
+
+
 def load_trending(conn: sqlite3.Connection, limit: int = 50) -> dict:
     now = _now()
     summary = {}

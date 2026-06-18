@@ -36,6 +36,53 @@ def _fmt_age(conn, key: str) -> str:
         return val
 
 
+def _resolve_league(conn, args) -> config.LeagueConfig | None:
+    """Find a league to talk to: CLI/.env first, else the last saved league.
+    Returns None if no league is known (tool stays league-agnostic)."""
+    cfg = config.load_league_config(
+        league_id=getattr(args, "league_id", None),
+        season=getattr(args, "season", None),
+        swid=getattr(args, "swid", None),
+        espn_s2=getattr(args, "espn_s2", None),
+        my_team_id=getattr(args, "my_team_id", None),
+    )
+    if cfg.has_league:
+        return cfg
+    row = conn.execute(
+        "SELECT league_id, season FROM league_settings ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    # Reuse env cookies for the saved league (private leagues).
+    cfg.league_id = row["league_id"]
+    cfg.season = row["season"]
+    return cfg
+
+
+def _refresh_projections(conn, args) -> None:
+    """Pull real ESPN projections if we have a league; otherwise note the skip.
+    Projection failures never abort a refresh — the engine falls back to the
+    rank-based placeholder."""
+    cfg = _resolve_league(conn, args)
+    if not cfg or not cfg.has_league:
+        print("Refreshing projections... skipped (no league configured; run "
+              "`config --league-id <id>` first). Engine uses placeholder "
+              "projections until then.")
+        return
+    print(f"Refreshing ESPN projections (league {cfg.league_id}, "
+          f"season {cfg.season}, scoring-aware)...")
+    try:
+        psum = ingest.load_projections(
+            conn, cfg.league_id, cfg.season, swid=cfg.swid, espn_s2=cfg.espn_s2)
+        print(f"  projections: {psum['matched']} matched to board, "
+              f"{psum['unmatched']} ESPN players unmatched "
+              f"(of {psum['espn_players']} projected)")
+    except PermissionError as e:
+        print(f"  projections: SKIPPED — {e}")
+    except Exception as e:
+        print(f"  projections: SKIPPED — error talking to ESPN: {e}")
+
+
 def cmd_refresh(args) -> int:
     conn = db.connect()
     db.init_db(conn)
@@ -48,8 +95,41 @@ def cmd_refresh(args) -> int:
     print("Refreshing Sleeper trending adds/drops...")
     tsum = ingest.load_trending(conn)
     print(f"  trending: {tsum.get('add',0)} adds, {tsum.get('drop',0)} drops")
+    if not args.no_projections:
+        _refresh_projections(conn, args)
     conn.close()
     print("Done.")
+    return 0
+
+
+def cmd_projections(args) -> int:
+    conn = db.connect()
+    db.init_db(conn)
+    cfg = _resolve_league(conn, args)
+    if not cfg or not cfg.has_league:
+        print("No league configured. Pass --league-id 123456 (or set "
+              "ESPN_LEAGUE_ID / run `config` first).", file=sys.stderr)
+        conn.close()
+        return 2
+    print(f"Pulling ESPN projections for league {cfg.league_id}, "
+          f"season {cfg.season}...")
+    try:
+        psum = ingest.load_projections(
+            conn, cfg.league_id, cfg.season, swid=cfg.swid, espn_s2=cfg.espn_s2)
+    except PermissionError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        conn.close()
+        return 1
+    except Exception as e:
+        print(f"ERROR talking to ESPN: {e}", file=sys.stderr)
+        conn.close()
+        return 1
+    cov = board.projection_coverage(conn)
+    conn.close()
+    print(f"  ESPN projected {psum['espn_players']} players; "
+          f"{psum['matched']} matched, {psum['unmatched']} unmatched.")
+    print(f"  Board coverage: {cov['real']}/{cov['total']} real, "
+          f"{cov['placeholder']} on placeholder.")
     return 0
 
 
@@ -160,6 +240,7 @@ def cmd_board(args) -> int:
         conn.close()
         return 1
     league, src, _ = board.load_league_settings(conn)
+    cov = board.projection_coverage(conn)
     conn.close()
 
     vorp.assign_vorp(players, league)
@@ -167,7 +248,12 @@ def cmd_board(args) -> int:
     pool = [p for p in players if (not args.pos or p.position == args.pos.upper())]
     pool.sort(key=lambda p: (p.vorp if p.vorp is not None else -1e9), reverse=True)
 
-    print(f"VORP board using {src}.  (projections are PLACEHOLDER until Phase 4)")
+    if cov["real"]:
+        proj_note = (f"real ESPN projections ({cov['real']}/{cov['total']}; "
+                     f"{cov['placeholder']} on placeholder)")
+    else:
+        proj_note = "PLACEHOLDER projections (run `projections` with a league)"
+    print(f"VORP board using {src}.  Projections: {proj_note}.")
     print(f"{'VORP':>6} {'POS':<4} {'TIER':>4}  {'NAME':<26} {'TEAM':<4} {'BYE':>3} {'ADP':>5}")
     for p in pool[:args.n]:
         print(f"{(p.vorp or 0):>6.0f} {p.position:<4} {str(p.tier):>4}  "
@@ -183,6 +269,13 @@ def cmd_status(args) -> int:
     print(f"  schema_version:           {db.get_meta(conn, 'schema_version')}")
     print(f"  players last refresh:     {_fmt_age(conn, 'sleeper_players_last_refresh')}")
     print(f"  trending last refresh:    {_fmt_age(conn, 'sleeper_trending_last_refresh')}")
+    proj_season = db.get_meta(conn, "espn_projections_season")
+    print(f"  projections last refresh: {_fmt_age(conn, 'espn_projections_last_refresh')}"
+          f"{f' (season {proj_season})' if proj_season else ''}")
+    cov = board.projection_coverage(conn)
+    if cov["total"]:
+        print(f"  projection coverage:      {cov['real']}/{cov['total']} real, "
+              f"{cov['placeholder']} placeholder")
     for table in ("players", "trending", "league_settings", "teams",
                   "picks", "rosters", "opponent_profiles"):
         n = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
@@ -196,18 +289,28 @@ def build_parser() -> argparse.ArgumentParser:
                                 description="Fantasy Draft Agent — Phase 1 data/config CLI")
     sub = p.add_subparsers(dest="command", required=True)
 
-    pr = sub.add_parser("refresh", help="Pull/refresh Sleeper players + trending")
+    def add_league_args(sp):
+        sp.add_argument("--league-id")
+        sp.add_argument("--season", type=int)
+        sp.add_argument("--swid", help="private leagues only")
+        sp.add_argument("--espn-s2", help="private leagues only")
+        sp.add_argument("--my-team-id", type=int)
+
+    pr = sub.add_parser("refresh", help="Pull Sleeper players + trending + ESPN projections")
     pr.add_argument("--force", action="store_true", help="ignore the 24h cache")
+    pr.add_argument("--no-projections", action="store_true",
+                    help="skip the ESPN projection pull")
+    add_league_args(pr)
     pr.set_defaults(func=cmd_refresh)
 
     pc = sub.add_parser("config", help="Read + print ESPN league config")
-    pc.add_argument("--league-id")
-    pc.add_argument("--season", type=int)
-    pc.add_argument("--swid", help="private leagues only")
-    pc.add_argument("--espn-s2", help="private leagues only")
-    pc.add_argument("--my-team-id", type=int)
+    add_league_args(pc)
     pc.add_argument("--no-save", action="store_true", help="print only, don't write DB")
     pc.set_defaults(func=cmd_config)
+
+    pj = sub.add_parser("projections", help="Pull real ESPN projections (league-scored)")
+    add_league_args(pj)
+    pj.set_defaults(func=cmd_projections)
 
     pp = sub.add_parser("players", help="Peek at the loaded board")
     pp.add_argument("--pos", help="filter by position (QB/RB/WR/TE/K/DEF)")

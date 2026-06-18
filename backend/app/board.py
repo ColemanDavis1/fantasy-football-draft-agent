@@ -45,10 +45,16 @@ def load_league_settings(conn: sqlite3.Connection) -> tuple[LeagueSettings, str,
 
 
 def load_engine_players(conn: sqlite3.Connection) -> list[Player]:
-    """Build engine Player objects for the full pool, with placeholder
-    rank-based projections (real projections arrive in Phase 4)."""
+    """Build engine Player objects for the full pool.
+
+    Uses real ESPN projections (proj_source='espn') when present and falls back
+    to the rank-based placeholder per-player for anyone ESPN didn't project.
+    Players carry their projection provenance in .proj_source so the UI/CLI can
+    say whether the board is real or placeholder.
+    """
     rows = conn.execute(
-        """SELECT player_id, full_name, position, team, bye_week, adp, search_rank
+        """SELECT player_id, full_name, position, team, bye_week, adp,
+                  search_rank, proj_points, proj_source
            FROM players WHERE active=1
              AND position IN ('QB','RB','WR','TE','K','DEF')"""
     ).fetchall()
@@ -60,6 +66,8 @@ def load_engine_players(conn: sqlite3.Connection) -> list[Player]:
         plist.sort(key=lambda r: (r["search_rank"] is None,
                                   r["search_rank"] if r["search_rank"] is not None else 1e9))
         for rank0, r in enumerate(plist):
+            real = r["proj_source"] == "espn" and r["proj_points"] is not None
+            proj = float(r["proj_points"]) if real else projections.project(pos, rank0)
             players.append(Player(
                 player_id=r["player_id"],
                 name=r["full_name"] or r["player_id"],
@@ -67,6 +75,21 @@ def load_engine_players(conn: sqlite3.Connection) -> list[Player]:
                 team=r["team"],
                 bye_week=r["bye_week"],
                 adp=float(r["adp"]) if r["adp"] is not None else 999.0,
-                proj_points=projections.project(pos, rank0),
+                proj_points=round(proj, 1),
+                proj_source="espn" if real else "placeholder",
             ))
     return players
+
+
+def projection_coverage(conn: sqlite3.Connection) -> dict:
+    """How much of the active board has real ESPN projections vs placeholder."""
+    row = conn.execute(
+        """SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN proj_source='espn' AND proj_points IS NOT NULL
+                           THEN 1 ELSE 0 END) AS real
+           FROM players WHERE active=1
+             AND position IN ('QB','RB','WR','TE','K','DEF')"""
+    ).fetchone()
+    total = row["total"] or 0
+    real = row["real"] or 0
+    return {"total": total, "real": real, "placeholder": total - real}

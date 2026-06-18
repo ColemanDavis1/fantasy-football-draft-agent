@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS players (
     bye_week         INTEGER,
     search_rank      INTEGER,               -- Sleeper overall rank (ADP proxy)
     adp              REAL,                   -- best available ADP (defaults to search_rank)
+    proj_points      REAL,                   -- season projection (ESPN kona, league-scored)
+    proj_source      TEXT,                   -- 'espn' / 'placeholder' / NULL
+    proj_updated_at  TEXT,
+    enrichment_json  TEXT,                   -- Phase 4 Claude pass: notes + sleeper/bust flags
     active           INTEGER DEFAULT 1,
     updated_at       TEXT
 );
@@ -130,8 +134,30 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+# Columns added after v1. ALTER TABLE ADD COLUMN is the only migration SQLite
+# needs here (all are nullable adds), so we apply them idempotently rather than
+# forcing a DB rebuild.
+_MIGRATIONS = {
+    "players": {
+        "proj_points": "REAL",
+        "proj_source": "TEXT",
+        "proj_updated_at": "TEXT",
+        "enrichment_json": "TEXT",
+    },
+}
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    for table, cols in _MIGRATIONS.items():
+        existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col, decl in cols.items():
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _apply_migrations(conn)
     conn.execute(
         "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
