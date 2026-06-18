@@ -28,7 +28,7 @@ Everything else (data, profiling, survival math) is deterministic and free.
 | **1** | Data + auto-config: Sleeper player DB/ADP cache, ESPN league auto-read, SQLite schema, verification CLI | ✅ done |
 | **2** | Recommendation engine (offline): VORP, tiers + cliff detection, opponent profiler, opponent-aware survival probability | ✅ done |
 | **3** | Live capture: browser extension (websocket-preferred, DOM fallback), turn detection, on-page recommendation overlay, FastAPI server, on-the-clock LLM (Opus 4.8) with no-LLM fallback, sync indicator + one-click correction | ✅ done |
-| 4 | Pre-draft enrichment (batched Claude pass) + historical opponent priors via ESPN `mDraftDetail` | planned |
+| **4** | Pre-draft enrichment: real ESPN projections (`kona_player_info`, league-scored), batched Claude scouting pass (sleeper/bust flags), historical opponent priors via ESPN `mDraftDetail` | ✅ done |
 | 5 | (optional) Claude-in-Chrome capture path + full local dashboard | planned |
 
 ## Quickstart (Phase 1)
@@ -73,8 +73,8 @@ The engine (`app/engine/`) is pure, deterministic functions: VORP with
 league-aware replacement baselines, per-position tiers + cliff detection, the
 opponent profiler (archetype, needs, ADP deviation, runs, stacks, byes), and
 opponent-aware survival probability. The LLM (Phase 3) only reasons over the
-shortlist these produce. Projections are a rank-based placeholder until Phase 4
-swaps in real ones.
+shortlist these produce. Projections start as a rank-based placeholder and are
+replaced by real ESPN projections in Phase 4 (the `board` output labels which).
 
 ### Phase 3 — live capture + recommendations (hands-off)
 
@@ -106,11 +106,66 @@ Verify the whole live loop without a browser or API key:
 python tests/test_server_sim.py   # saves a synthetic league, drives 28 picks
 ```
 
+### Phase 4 — pre-draft enrichment + historical priors
+
+Phase 4 replaces the placeholder projections with real ones and adds two
+optional intelligence layers. None of it changes the live flow — it just makes
+the board and the opponent model sharper.
+
+```bash
+# 1. Real projections (league-scored). Folded into `refresh` once a league is
+#    configured, or run standalone. ESPN applies YOUR scoring (PPR/half/superflex)
+#    to each projection, so cross-position VORP is finally trustworthy.
+python -m app.cli projections --league-id 123456
+python -m app.cli board -n 30        # now labelled "real ESPN projections"
+
+# 2. Night-before Claude scouting pass (Batch API, 50% off). One scouting note +
+#    a sleeper/value/solid/risk/bust flag per player, grounded in fresh web
+#    research. Needs ANTHROPIC_API_KEY; skipped cleanly without one.
+python -m app.cli enrich --limit 150          # submit + wait + write
+python -m app.cli enrich --limit 150 --no-wait  # submit only...
+python -m app.cli enrich --collect              # ...collect later
+
+# 3. Historical opponent priors (returning leagues). Learns each manager's
+#    tendencies from past drafts via ESPN mDraftDetail and attaches a prior to
+#    their CURRENT team. Live picks refine it as the draft unfolds.
+python -m app.cli priors --league-id 123456 --prior-seasons 2023 2024 2025
+```
+
+Projection provenance and enrichment/priors freshness all show up in
+`python -m app.cli status`. The on-the-clock LLM sees each shortlist player's
+scouting note and each opponent's historical archetype, so its reasoning is
+projection-, scouting-, and history-aware.
+
+### Draft-day runbook
+
+The full hands-off sequence, start to finish:
+
+```bash
+cd backend
+# --- The night before ---
+python -m app.cli refresh --force                       # latest players/byes/trends
+python -m app.cli config --league-id 123456 --my-team-id 7   # auto-read + confirm league
+python -m app.cli projections                           # real, league-scored projections
+python -m app.cli priors --prior-seasons 2023 2024 2025 # returning leagues only
+python -m app.cli enrich                                # optional Claude scouting pass
+
+# --- Draft time ---
+uvicorn app.server:app --port 8000                      # start the local server
+curl -X POST http://localhost:8000/session/reset        # load the configured league
+# Load frontend/extension/ in Chrome (Developer mode -> Load unpacked), open your
+# ESPN draft, and watch the overlay. Click your pick when prompted — that's it.
+```
+
+Set `ANTHROPIC_API_KEY` in `.env` for on-the-clock reasoning + enrichment; leave
+it unset to run everything else at $0.
+
 ### Refreshing later
 
 You won't draft for a while; data refreshes on demand. Just re-run
 `python -m app.cli refresh` (optionally `--force`) before your draft to pull the
-latest players, injuries, byes, and trends.
+latest players, injuries, byes, and trends (it pulls projections too once a
+league is configured).
 
 ## Configuration
 
@@ -131,8 +186,13 @@ required to refresh data. For reading a specific league:
 - **Sleeper** (no auth): full player DB, trending adds/drops. ADP is proxied by
   Sleeper's `search_rank` (a richer ADP source can plug in later).
 - **ESPN read API** (`lm-api-reads.fantasy.espn.com`): league config via
-  `mSettings`+`mTeam`, pro-team bye weeks, and past drafts via `mDraftDetail`
-  (completed drafts only — live picks come from the draft room in Phase 3).
+  `mSettings`+`mTeam`, pro-team bye weeks, real season projections via
+  `kona_player_info` (scored under your league's rules), and past drafts via
+  `mDraftDetail` (completed drafts only — live picks come from the draft room in
+  Phase 3).
+- **Claude API** (optional, env key only): a night-before Batch API scouting
+  pass with web search for sleeper/bust flags, and on-the-clock Opus 4.8
+  reasoning over the engine shortlist.
 
 ## Project layout
 
@@ -141,8 +201,10 @@ backend/
   app/
     config.py        runtime config (env/.env/CLI merge; nothing league-specific baked in)
     db.py            SQLite connection + full schema (covers all phases)
-    ingest.py        load Sleeper + ESPN data into SQLite (idempotent upserts)
-    cli.py           Phase 1 verification CLI
+    ingest.py        load Sleeper + ESPN data (players, projections) into SQLite
+    enrich.py        Phase 4 night-before Claude scouting pass (Batch API)
+    priors.py        Phase 4 historical opponent priors from past drafts
+    cli.py           CLI: refresh / config / projections / enrich / priors / board / status
     data/
       sleeper.py     Sleeper client + disk cache
       espn.py        ESPN read-API client + config parser
@@ -161,8 +223,11 @@ backend/
       sample.py      hardcoded sample draft state (for tests/demo)
       demo.py        prints a full recommendation for the sample
   tests/
-    test_engine.py     offline proof of the engine math
-    test_server_sim.py end-to-end live-pipeline simulation (no browser/LLM)
+    test_engine.py      offline proof of the engine math
+    test_projections.py ESPN projection parse + board join (synthetic payload)
+    test_enrich.py      enrichment JSON extraction + board join
+    test_priors.py      draft-recap parse + cross-season owner priors
+    test_server_sim.py  end-to-end live-pipeline simulation (no browser/LLM)
   data_cache/        gitignored disk cache (regenerated on demand)
   draft.db           gitignored SQLite DB
 frontend/

@@ -8,5 +8,7 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
 
-# Phase 3/4 (on-the-clock + pre-draft enrichment)
-anthropic>=0.40
+# Phase 3/4 (on-the-clock + pre-draft enrichment).
+# Needs a modern SDK: Batch API, output_config/structured outputs, adaptive
+# thinking, and the web_search server tool used by the enrichment pass.
+anthropic>=0.69
