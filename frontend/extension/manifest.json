@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Fantasy Draft Agent",
+  "version": "0.1.0",
+  "description": "Auto-captures your ESPN draft picks and shows the optimal pick as an on-page overlay. Talks to your local recommendation server.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "http://localhost:8000/*",
+    "http://127.0.0.1:8000/*",
+    "https://*.espn.com/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "Fantasy Draft Agent" },
+  "content_scripts": [
+    {
+      "matches": ["https://*.espn.com/*"],
+      "js": ["inject.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://*.espn.com/*"],
+      "js": ["content.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}

@@ -27,7 +27,7 @@ Everything else (data, profiling, survival math) is deterministic and free.
 |-------|------|--------|
 | **1** | Data + auto-config: Sleeper player DB/ADP cache, ESPN league auto-read, SQLite schema, verification CLI | ✅ done |
 | **2** | Recommendation engine (offline): VORP, tiers + cliff detection, opponent profiler, opponent-aware survival probability | ✅ done |
-| 3 | Live capture: browser extension (websocket-preferred, DOM fallback), turn detection, on-page recommendation overlay, FastAPI server, sync indicator + one-click correction | planned |
+| **3** | Live capture: browser extension (websocket-preferred, DOM fallback), turn detection, on-page recommendation overlay, FastAPI server, on-the-clock LLM (Opus 4.8) with no-LLM fallback, sync indicator + one-click correction | ✅ done |
 | 4 | Pre-draft enrichment (batched Claude pass) + historical opponent priors via ESPN `mDraftDetail` | planned |
 | 5 | (optional) Claude-in-Chrome capture path + full local dashboard | planned |
 
@@ -76,6 +76,36 @@ opponent-aware survival probability. The LLM (Phase 3) only reasons over the
 shortlist these produce. Projections are a rank-based placeholder until Phase 4
 swaps in real ones.
 
+### Phase 3 — live capture + recommendations (hands-off)
+
+```bash
+# 1. Start the local server (from backend/):
+uvicorn app.server:app --port 8000
+
+# 2. On draft day, point it at your league, then reload the session:
+python -m app.cli config --league-id 123456 --my-team-id 7
+curl -X POST http://localhost:8000/session/reset
+
+# 3. Load the extension and open your draft (see frontend/extension/README.md):
+#    chrome://extensions -> Developer mode -> Load unpacked -> frontend/extension/
+```
+
+The extension auto-captures every pick (websocket preferred, DOM fallback),
+detects your turn, and renders the recommendation as an overlay on the ESPN
+page. The server matches each pick, updates all rosters + opponent profiles, and
+returns a recommendation; when it's **your** turn it adds Opus 4.8's reasoning
+over the engine shortlist (set `ANTHROPIC_API_KEY` in `.env`, or leave it unset
+for free no-LLM mode). A sync indicator + one-click correction back up the feed.
+
+Server endpoints: `/health`, `/state`, `/pick`, `/pick/correct`,
+`/recommendation`, `/sync`, `/session/reset` (interactive docs at `/docs`).
+
+Verify the whole live loop without a browser or API key:
+
+```bash
+python tests/test_server_sim.py   # saves a synthetic league, drives 28 picks
+```
+
 ### Refreshing later
 
 You won't draft for a while; data refreshes on demand. Just re-run
@@ -116,6 +146,11 @@ backend/
     data/
       sleeper.py     Sleeper client + disk cache
       espn.py        ESPN read-API client + config parser
+    server.py        Phase 3 FastAPI server (pick ingestion + recommendation)
+    session.py       live draft session: picks -> engine -> recommendation
+    match.py         resolve ESPN picks to our players (espn_id / name / D-ST)
+    llm.py           on-the-clock Opus 4.8 reasoning (prompt-cached, no-LLM fallback)
+    board.py         DB rows -> engine models (shared by CLI + server)
     engine/          Phase 2 recommendation engine (pure functions)
       vorp.py        value over replacement, league-aware baselines
       tiers.py       per-position tiers + cliff detection
@@ -126,10 +161,18 @@ backend/
       sample.py      hardcoded sample draft state (for tests/demo)
       demo.py        prints a full recommendation for the sample
   tests/
-    test_engine.py   offline proof of the engine math
+    test_engine.py     offline proof of the engine math
+    test_server_sim.py end-to-end live-pipeline simulation (no browser/LLM)
   data_cache/        gitignored disk cache (regenerated on demand)
   draft.db           gitignored SQLite DB
-frontend/            browser extension + dashboard (Phase 3+)
+frontend/
+  extension/         Chrome MV3 extension: capture + overlay (Phase 3)
+    manifest.json    MV3 config
+    inject.js        page-context WebSocket interceptor (MAIN world)
+    content.js       pick parsing, DOM fallback, turn detection, overlay
+    background.js    talks to the local server (avoids CORS)
+    popup.html/js    settings, connection check, manual correction
+    overlay.css      on-page overlay styling
 ```
 
 ## Privacy & safety

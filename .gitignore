@@ -15,6 +15,10 @@ venv/
 backend/data_cache/
 backend/*.db
 backend/*.db-journal
+backend/*.db-shm
+backend/*.db-wal
+*.db-shm
+*.db-wal
 *.sqlite
 *.sqlite3
 
