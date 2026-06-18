@@ -1,0 +1,12 @@
+# Phase 1 needs httpx + python-dotenv. The rest are pre-listed for Phase 2/3 so
+# `pip install -r requirements.txt` once covers the whole build.
+httpx>=0.27
+python-dotenv>=1.0
+
+# Phase 2/3 (recommendation engine + live server)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# Phase 3/4 (on-the-clock + pre-draft enrichment)
+anthropic>=0.40
