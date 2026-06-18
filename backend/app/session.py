@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 
-from . import board, db
+from . import board, db, priors
 from .engine import tiers, vorp
 from .engine.draftflow import team_id_for_overall
 from .engine.models import DraftState, Pick
@@ -37,6 +37,10 @@ class DraftSession:
         players = board.load_engine_players(conn)
         self.players_by_id = {p.player_id: p for p in players}
         self.matcher = PlayerMatcher(conn)
+
+        # Historical priors (Phase 4): seed opponents so they're not blank on
+        # pick 1. Live picks refine the picture as the draft unfolds.
+        self.priors = priors.load_priors(conn, self.league_id, self.season)
 
         # picks: overall -> Pick. Load any already persisted for this league.
         self.picks: dict[int, Pick] = {}
@@ -157,6 +161,7 @@ class DraftSession:
             prof = profiles[tid]
             roster = [{"name": p.name, "pos": p.position, "team": p.team,
                        "bye": p.bye_week} for p in state.roster(tid)]
+            prior = self.priors.get(tid)
             teams.append({
                 "team_id": tid,
                 "is_me": tid == self.my_team_id,
@@ -166,6 +171,10 @@ class DraftSession:
                 "needs": prof.unfilled_starter_slots,
                 "stacks": prof.stacks,
                 "bye_conflicts": prof.bye_conflicts,
+                # Historical prior (None if no past drafts seeded). Most useful
+                # early, before live picks reveal this year's archetype.
+                "prior_archetype": prior.get("archetype") if prior else None,
+                "prior": prior,
                 "roster": roster,
             })
         return {

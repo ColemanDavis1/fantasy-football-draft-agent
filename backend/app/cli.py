@@ -17,7 +17,7 @@ import argparse
 import json
 import sys
 
-from . import board, config, db, enrich, ingest
+from . import board, config, db, enrich, ingest, priors
 from .data import espn
 from .engine import tiers, vorp
 
@@ -247,6 +247,55 @@ def cmd_enrich(args) -> int:
     return 0
 
 
+def cmd_priors(args) -> int:
+    conn = db.connect()
+    db.init_db(conn)
+    cfg = _resolve_league(conn, args)
+    if not cfg or not cfg.has_league:
+        print("No league configured. Run `config --league-id <id>` first "
+              "(priors attach to your current teams).", file=sys.stderr)
+        conn.close()
+        return 2
+    if not args.prior_seasons:
+        print("Pass --prior-seasons (e.g. --prior-seasons 2023 2024 2025) — the "
+              "completed seasons to learn each manager's tendencies from.",
+              file=sys.stderr)
+        conn.close()
+        return 2
+    print(f"Building opponent priors for league {cfg.league_id} (season "
+          f"{cfg.season}) from prior drafts {args.prior_seasons}...")
+    try:
+        res = priors.build_priors(
+            conn, cfg.league_id, cfg.season, args.prior_seasons,
+            prior_league_id=args.prior_league_id,
+            swid=cfg.swid, espn_s2=cfg.espn_s2)
+    except PermissionError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        conn.close()
+        return 1
+    except Exception as e:
+        print(f"ERROR building priors: {e}", file=sys.stderr)
+        conn.close()
+        return 1
+    if not res["seasons_used"]:
+        print("No past drafts found (mDraftDetail empty for those seasons). "
+              "Are the league/season IDs correct, and are those drafts complete?")
+        conn.close()
+        return 1
+    print(f"  used seasons {res['seasons_used']}: profiled {res['owners']} "
+          f"managers, attached priors to {res['written']} current teams.")
+    loaded = priors.load_priors(conn, cfg.league_id, cfg.season)
+    for tid, p in sorted(loaded.items()):
+        name = p.get("name") or f"team {tid}"
+        share = ", ".join(f"{k} {int(v*100)}%" for k, v in
+                          sorted(p.get("position_share", {}).items(),
+                                 key=lambda kv: -kv[1])[:3])
+        print(f"    team {tid:>2} {name[:18]:<18} prior={p['archetype']:<12} "
+              f"top: {share}")
+    conn.close()
+    return 0
+
+
 def cmd_players(args) -> int:
     conn = db.connect()
     db.init_db(conn)
@@ -325,6 +374,7 @@ def cmd_status(args) -> int:
     ecov = enrich.coverage(conn)
     if ecov["total"]:
         print(f"  enrichment coverage:      {ecov['enriched']}/{ecov['total']} players")
+    print(f"  priors last built:        {_fmt_age(conn, 'priors_last_built_at')}")
     for table in ("players", "trending", "league_settings", "teams",
                   "picks", "rosters", "opponent_profiles"):
         n = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
@@ -371,6 +421,14 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--collect", action="store_true",
                     help="fetch results for a previously submitted batch")
     pe.set_defaults(func=cmd_enrich)
+
+    pp2 = sub.add_parser("priors", help="Seed opponent priors from past drafts (mDraftDetail)")
+    add_league_args(pp2)
+    pp2.add_argument("--prior-seasons", type=int, nargs="+",
+                     help="completed seasons to learn from, e.g. 2023 2024 2025")
+    pp2.add_argument("--prior-league-id",
+                     help="prior-season league id if different from current")
+    pp2.set_defaults(func=cmd_priors)
 
     pp = sub.add_parser("players", help="Peek at the loaded board")
     pp.add_argument("--pos", help="filter by position (QB/RB/WR/TE/K/DEF)")

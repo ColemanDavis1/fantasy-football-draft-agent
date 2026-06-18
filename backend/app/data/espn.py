@@ -179,6 +179,75 @@ def parse_projections(payload: dict, season: int) -> dict[str, dict]:
     return out
 
 
+def parse_player_positions(payload: dict) -> dict[str, str]:
+    """Map ESPN player id (str) -> position from a kona_player_info payload.
+    Unlike parse_projections this keeps every player (no stats requirement),
+    so it works on a completed past season for seeding opponent priors."""
+    out: dict[str, str] = {}
+    for item in payload.get("players") or []:
+        player = item.get("player") if isinstance(item.get("player"), dict) else item
+        espn_id = player.get("id") or item.get("id")
+        pos = ESPN_POSITION_BY_ID.get(player.get("defaultPositionId"))
+        if espn_id is not None and pos:
+            out[str(espn_id)] = pos
+    return out
+
+
+def fetch_player_positions(league_id: str, season: int, swid: str | None = None,
+                           espn_s2: str | None = None) -> dict[str, str]:
+    """espn_id -> position for a season, via the kona_player_info view."""
+    payload = fetch_player_projections(league_id, season, swid=swid,
+                                       espn_s2=espn_s2, limit=2000)
+    return parse_player_positions(payload)
+
+
+def fetch_draft_detail(league_id: str, season: int, swid: str | None = None,
+                       espn_s2: str | None = None) -> dict:
+    """Fetch a COMPLETED draft's recap (mDraftDetail) + teams (mTeam).
+
+    mDraftDetail only populates for finished drafts — exactly the past-season
+    case we want for seeding opponent priors. mTeam comes along so we can map
+    each pick's teamId to the manager (owner) who made it."""
+    return fetch_league(league_id, season, ["mDraftDetail", "mTeam"],
+                        swid=swid, espn_s2=espn_s2)
+
+
+def parse_draft_picks(payload: dict) -> list[dict]:
+    """Return draft picks as
+    [{overall, round, pick_in_round, team_id, espn_player_id, keeper}]."""
+    detail = payload.get("draftDetail") or {}
+    picks = []
+    for p in detail.get("picks") or []:
+        picks.append({
+            "overall": p.get("overallPickNumber"),
+            "round": p.get("roundId"),
+            "pick_in_round": p.get("roundPickNumber"),
+            "team_id": p.get("teamId"),
+            "espn_player_id": str(p.get("playerId")) if p.get("playerId") is not None else None,
+            "keeper": bool(p.get("keeper")),
+        })
+    picks.sort(key=lambda x: (x["overall"] is None, x["overall"] or 0))
+    return picks
+
+
+def team_owner_map(payload: dict) -> dict[int, str]:
+    """team_id -> stable owner id (ESPN member GUID). Lets us follow a manager
+    across seasons even when their team_id changes."""
+    out: dict[int, str] = {}
+    for t in payload.get("teams") or []:
+        owners = t.get("owners") or ([t.get("primaryOwner")] if t.get("primaryOwner") else [])
+        owner = next((o for o in owners if o), None)
+        if t.get("id") is not None and owner:
+            out[t["id"]] = owner
+    return out
+
+
+def member_name_map(payload: dict) -> dict[str, str]:
+    """owner id -> display name."""
+    return {m.get("id"): m.get("displayName")
+            for m in (payload.get("members") or []) if m.get("id")}
+
+
 def _detect_scoring(settings: dict) -> tuple[str, float]:
     """Return (scoring_type, ppr_value) from the reception scoring item."""
     scoring_items = (settings.get("scoringSettings") or {}).get("scoringItems") or []

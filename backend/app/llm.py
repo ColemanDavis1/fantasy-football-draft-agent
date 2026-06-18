@@ -76,8 +76,13 @@ def _situation_text(session: DraftSession, rec: Recommendation) -> str:
         roster = ", ".join(f"{r['name']}({r['pos']})" for r in t["roster"]) or "empty"
         needs = ", ".join(f"{s}x{c}" for s, c in t["needs"].items()) or "full"
         run = f", {t['tendency']}" if t["tendency"] != "ADP-aligned" else ""
+        # Historical prior, when seeded — most informative before this team has
+        # revealed an archetype with live picks.
+        prior = ""
+        if t.get("prior_archetype") and t["archetype"] in ("Undeclared", "Balanced/BPA"):
+            prior = f", prior:{t['prior_archetype']}"
         lines.append(
-            f"  T{t['team_id']}{me} [{t['archetype']}{run}] needs: {needs} | "
+            f"  T{t['team_id']}{me} [{t['archetype']}{run}{prior}] needs: {needs} | "
             f"roster: {roster}"
         )
     lines.append("")
