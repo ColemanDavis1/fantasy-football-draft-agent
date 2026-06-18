@@ -26,7 +26,7 @@ Everything else (data, profiling, survival math) is deterministic and free.
 | Phase | What | Status |
 |-------|------|--------|
 | **1** | Data + auto-config: Sleeper player DB/ADP cache, ESPN league auto-read, SQLite schema, verification CLI | ✅ done |
-| 2 | Recommendation engine (offline): VORP, tiers, opponent profiler, opponent-aware survival probability | planned |
+| **2** | Recommendation engine (offline): VORP, tiers + cliff detection, opponent profiler, opponent-aware survival probability | ✅ done |
 | 3 | Live capture: browser extension (websocket-preferred, DOM fallback), turn detection, on-page recommendation overlay, FastAPI server, sync indicator + one-click correction | planned |
 | 4 | Pre-draft enrichment (batched Claude pass) + historical opponent priors via ESPN `mDraftDetail` | planned |
 | 5 | (optional) Claude-in-Chrome capture path + full local dashboard | planned |
@@ -53,6 +53,28 @@ python -m app.cli config --league-id 123456 --my-team-id 7
 
 `config` prints the detected scoring, superflex flag, roster slots, draft type,
 and full draft order (with **YOU** marked) for a quick confirm, then saves it.
+
+### Phase 2 — recommendation engine (offline)
+
+```bash
+# Prove the math against a hardcoded sample draft (no deps needed):
+python tests/test_engine.py
+
+# See a full on-the-clock recommendation for the sample draft state
+# (rosters + needs + tendencies, ranked top-5 with signals, primary pick):
+python -m app.engine.demo
+
+# Run VORP + tiers on the LIVE board you loaded (placeholder projections):
+python -m app.cli board -n 30
+python -m app.cli board --pos RB -n 15
+```
+
+The engine (`app/engine/`) is pure, deterministic functions: VORP with
+league-aware replacement baselines, per-position tiers + cliff detection, the
+opponent profiler (archetype, needs, ADP deviation, runs, stacks, byes), and
+opponent-aware survival probability. The LLM (Phase 3) only reasons over the
+shortlist these produce. Projections are a rank-based placeholder until Phase 4
+swaps in real ones.
 
 ### Refreshing later
 
@@ -94,6 +116,17 @@ backend/
     data/
       sleeper.py     Sleeper client + disk cache
       espn.py        ESPN read-API client + config parser
+    engine/          Phase 2 recommendation engine (pure functions)
+      vorp.py        value over replacement, league-aware baselines
+      tiers.py       per-position tiers + cliff detection
+      profiler.py    opponent tendency profiles + roster needs
+      survival.py    opponent-aware P(available at next pick)
+      draftflow.py   snake-draft order math
+      recommend.py   shortlist + signals + templated rationale
+      sample.py      hardcoded sample draft state (for tests/demo)
+      demo.py        prints a full recommendation for the sample
+  tests/
+    test_engine.py   offline proof of the engine math
   data_cache/        gitignored disk cache (regenerated on demand)
   draft.db           gitignored SQLite DB
 frontend/            browser extension + dashboard (Phase 3+)

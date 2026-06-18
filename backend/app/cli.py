@@ -17,8 +17,12 @@ import argparse
 import json
 import sys
 
+import json as _json
+
 from . import config, db, ingest
 from .data import espn
+from .engine import projections, tiers, vorp
+from .engine.models import LeagueSettings, Player
 
 
 def _fmt_age(conn, key: str) -> str:
@@ -150,6 +154,76 @@ def cmd_players(args) -> int:
     return 0
 
 
+_DEFAULT_SLOTS = {"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "D/ST": 1, "K": 1}
+
+
+def _load_league_settings(conn) -> tuple[LeagueSettings, str]:
+    row = conn.execute(
+        "SELECT * FROM league_settings ORDER BY updated_at DESC LIMIT 1"
+    ).fetchone()
+    if row:
+        slots = _json.loads(row["starter_slots"] or "{}") or _DEFAULT_SLOTS
+        return (LeagueSettings(
+            num_teams=row["num_teams"] or 12,
+            starter_slots=slots,
+            scoring_type=row["scoring_type"] or "ppr",
+            is_superflex=bool(row["is_superflex"]),
+        ), f"league {row['league_id']} ({row['scoring_type']})")
+    return (LeagueSettings(num_teams=12, starter_slots=_DEFAULT_SLOTS,
+                           scoring_type="ppr"), "default 12-team PPR (no league saved)")
+
+
+def _load_engine_players(conn) -> list[Player]:
+    rows = conn.execute(
+        """SELECT player_id, full_name, position, team, bye_week, adp, search_rank
+           FROM players WHERE active=1 AND position IN ('QB','RB','WR','TE','K','DEF')"""
+    ).fetchall()
+    # Rank within each position (search_rank asc, nulls last) -> placeholder proj.
+    by_pos: dict[str, list] = {}
+    for r in rows:
+        by_pos.setdefault(r["position"], []).append(r)
+    players: list[Player] = []
+    for pos, plist in by_pos.items():
+        plist.sort(key=lambda r: (r["search_rank"] is None,
+                                  r["search_rank"] if r["search_rank"] is not None else 1e9))
+        for rank0, r in enumerate(plist):
+            players.append(Player(
+                player_id=r["player_id"],
+                name=r["full_name"] or r["player_id"],
+                position=pos,
+                team=r["team"],
+                bye_week=r["bye_week"],
+                adp=float(r["adp"]) if r["adp"] is not None else 999.0,
+                proj_points=projections.project(pos, rank0),
+            ))
+    return players
+
+
+def cmd_board(args) -> int:
+    conn = db.connect()
+    db.init_db(conn)
+    players = _load_engine_players(conn)
+    if not players:
+        print("No players loaded. Run: python -m app.cli refresh")
+        conn.close()
+        return 1
+    league, src = _load_league_settings(conn)
+    conn.close()
+
+    vorp.assign_vorp(players, league)
+    tiers.assign_tiers(players)
+    pool = [p for p in players if (not args.pos or p.position == args.pos.upper())]
+    pool.sort(key=lambda p: (p.vorp if p.vorp is not None else -1e9), reverse=True)
+
+    print(f"VORP board using {src}.  (projections are PLACEHOLDER until Phase 4)")
+    print(f"{'VORP':>6} {'POS':<4} {'TIER':>4}  {'NAME':<26} {'TEAM':<4} {'BYE':>3} {'ADP':>5}")
+    for p in pool[:args.n]:
+        print(f"{(p.vorp or 0):>6.0f} {p.position:<4} {str(p.tier):>4}  "
+              f"{p.name[:26]:<26} {p.team or '-':<4} {str(p.bye_week or '-'):>3} "
+              f"{p.adp:>5.0f}")
+    return 0
+
+
 def cmd_status(args) -> int:
     conn = db.connect()
     db.init_db(conn)
@@ -187,6 +261,11 @@ def build_parser() -> argparse.ArgumentParser:
     pp.add_argument("--pos", help="filter by position (QB/RB/WR/TE/K/DEF)")
     pp.add_argument("-n", type=int, default=25)
     pp.set_defaults(func=cmd_players)
+
+    pb = sub.add_parser("board", help="VORP + tiers on the live board (placeholder projections)")
+    pb.add_argument("--pos", help="filter by position (QB/RB/WR/TE/K/DEF)")
+    pb.add_argument("-n", type=int, default=30)
+    pb.set_defaults(func=cmd_board)
 
     ps = sub.add_parser("status", help="Cache ages + row counts")
     ps.set_defaults(func=cmd_status)
