@@ -150,6 +150,26 @@ def profile_all(state: DraftState) -> dict[int, TeamProfile]:
     return {tid: profile_team(state, tid) for tid in state.draft_order}
 
 
+def recent_position_counts(state: DraftState, window: int) -> dict[str, int]:
+    """Positions taken in the last `window` picks across the whole league.
+    The basis for detecting an active positional run."""
+    recent = sorted(state.picks, key=lambda p: p.overall)[-window:]
+    counts: dict[str, int] = {}
+    for pk in recent:
+        pl = state.players_by_id.get(pk.player_id)
+        if pl:
+            counts[pl.position] = counts.get(pl.position, 0) + 1
+    return counts
+
+
+def active_runs(state: DraftState, window: int = 6, threshold: int = 3
+                ) -> dict[str, int]:
+    """Positions experiencing a run right now: {pos: count} where count of that
+    position in the last `window` picks is >= `threshold`."""
+    counts = recent_position_counts(state, window)
+    return {pos: c for pos, c in counts.items() if c >= threshold}
+
+
 def tendency_label(prof: TeamProfile) -> str:
     if prof.adp_deviation > REACH_THRESHOLD:
         return "reacher"

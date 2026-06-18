@@ -19,8 +19,9 @@ from app.data import espn
 from app.engine import tiers, vorp
 from app.engine.draftflow import intervening_team_ids, team_id_for_overall
 from app.engine.models import DraftState, Pick
-from app.engine.profiler import compute_needs, profile_all, tendency_label
-from app.engine.recommend import build_recommendation
+from app.engine.profiler import (active_runs, compute_needs, profile_all,
+                                  tendency_label)
+from app.engine.recommend import RUN_THRESHOLD, RUN_WINDOW, build_recommendation
 
 SCORING_REC = {"ppr": 1.0, "half_ppr": 0.5, "standard": 0.0}
 DETAIL_ROUNDS = 8           # show the full overlay for my first N picks
@@ -120,6 +121,11 @@ def overlay(state: DraftState, rec, profiles, full: bool):
           f"({rec.picks_until_next} picks away)")
     print("=" * 70)
 
+    runs = active_runs(state, window=RUN_WINDOW, threshold=RUN_THRESHOLD)
+    if runs:
+        print("  ACTIVE RUNS: " + ", ".join(
+            f"{pos} ({c} of last {RUN_WINDOW})" for pos, c in runs.items()))
+
     inter = intervening_team_ids(state)
     if inter:
         seen, order = {}, []
@@ -135,12 +141,13 @@ def overlay(state: DraftState, rec, profiles, full: bool):
             print(f"    T{tid:<2} [{pr.archetype}{tag}] x{seen[tid]} | {needs}")
 
     print(f"\n  {'PLAYER':<22} {'POS':<4} {'TM':<4} {'BYE':>3} {'VORP':>5} "
-          f"{'TIER':>4} {'LEFT':>4} {'P(back)':>7}")
+          f"{'TIER':>4} {'LEFT':>4} {'DROP':>5} {'P(back)':>7} {'RUN':>4}")
     for c in rec.shortlist:
         print(f"  {c.player.name[:22]:<22} {c.player.position:<4} "
               f"{(c.player.team or '-'):<4} {str(c.player.bye_week or '-'):>3} "
               f"{c.vorp:>5.0f} {('T'+str(c.tier)):>4} {c.players_left_in_tier:>4} "
-              f"{c.p_available_next:>6.0%}")
+              f"{c.tier_dropoff:>5.0f} {c.p_available_next:>6.0%} "
+              f"{('yes' if c.run_active else '-'):>4}")
     print(f"\n  >> RECOMMENDATION: {rec.primary.player.name} "
           f"({rec.primary.player.position})")
     print(f"     {rec.rationale}")

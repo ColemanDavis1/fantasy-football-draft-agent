@@ -59,3 +59,27 @@ def players_left_in_tier(available: list[Player], player: Player) -> int:
     if player.tier is None:
         return 0
     return len(tier_members_available(available, player.position, player.tier))
+
+
+def tier_dropoff(available: list[Player], player: Player) -> float:
+    """VORP gap from this player down to the best available player at the same
+    position in a worse tier — i.e. the value cliff you face at his position
+    once this tier is gone. Large dropoff + few left = scarce; draft now."""
+    if player.tier is None:
+        return 0.0
+    pv = player.vorp or 0.0
+    lower = [p for p in available
+             if p.position == player.position and p.tier is not None
+             and p.tier > player.tier]
+    if not lower:
+        return max(pv, 0.0)  # nothing comparable left below him
+    best_lower = max(lower, key=lambda p: (p.vorp if p.vorp is not None else -1e9))
+    return max(pv - (best_lower.vorp or 0.0), 0.0)
+
+
+def quality_remaining(available: list[Player], position: str,
+                      min_vorp: float = 0.0) -> int:
+    """How many startable-quality players (VORP >= min_vorp) remain at a
+    position. A blunt cross-position scarcity gauge."""
+    return sum(1 for p in available
+               if p.position == position and (p.vorp or -1e9) >= min_vorp)

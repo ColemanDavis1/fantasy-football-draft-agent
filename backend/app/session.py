@@ -206,6 +206,9 @@ def _cand_to_dict(c) -> dict:
         "needed_by_intervening": c.needed_by_intervening,
         "roster_fit": c.roster_fit,
         "fills_need": c.fills_need,
+        "tier_dropoff": c.tier_dropoff,
+        "run_active": c.run_active,
+        "run_count": c.run_count,
     }
 
 

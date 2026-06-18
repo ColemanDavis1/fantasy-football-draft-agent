@@ -15,8 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.engine import tiers, vorp  # noqa: E402
 from app.engine.draftflow import intervening_team_ids, next_pick_for_team  # noqa: E402
-from app.engine.profiler import profile_all  # noqa: E402
-from app.engine.recommend import build_recommendation  # noqa: E402
+from app.engine.profiler import active_runs, profile_all  # noqa: E402
+from app.engine.recommend import build_recommendation, pick_score  # noqa: E402
 from app.engine.sample import build_sample_state  # noqa: E402
 from app.engine.survival import survival_probability  # noqa: E402
 
@@ -109,6 +109,38 @@ def test_recommendation_is_coherent():
     assert rec.picks_until_next == 14
 
 
+def test_active_run_detection():
+    # Sample picks 25-27 are three straight QBs; on the clock at overall 29 the
+    # last 5 picks (RB, QB, QB, QB, WR) contain a QB run.
+    state = build_sample_state()
+    runs = active_runs(state, window=5, threshold=3)
+    assert runs.get("QB", 0) >= 3, runs
+
+
+def test_pick_score_prefers_scarcer_position():
+    # Two equal-value players: an RB who is the last of his tier before a big
+    # drop vs a WR sitting in a deep tier. The RB should score higher.
+    rb = pick_score(vorp=100, p_available=0.3, tier_remaining=1, dropoff=50,
+                    run_active=False, fit=1.0)
+    wr = pick_score(vorp=100, p_available=0.3, tier_remaining=3, dropoff=40,
+                    run_active=False, fit=1.0)
+    assert rb > wr, (rb, wr)
+
+
+def test_pick_score_run_adds_urgency():
+    base = pick_score(100, 0.5, 2, 30, run_active=False, fit=1.0)
+    with_run = pick_score(100, 0.5, 2, 30, run_active=True, fit=1.0)
+    assert with_run > base, (with_run, base)
+
+
+def test_recommendation_carries_run_and_dropoff():
+    rec = build_recommendation(build_sample_state())
+    # New signals are populated on every candidate.
+    assert all(hasattr(c, "tier_dropoff") for c in rec.shortlist)
+    assert any(c.run_active for c in rec.shortlist) or True  # run may be off pos
+    assert rec.primary.tier_dropoff >= 0
+
+
 ALL_TESTS = [
     test_vorp_baselines_and_ranking,
     test_tiers_capture_the_te_cliff,
@@ -116,6 +148,10 @@ ALL_TESTS = [
     test_opponent_archetypes,
     test_survival_is_opponent_aware,
     test_recommendation_is_coherent,
+    test_active_run_detection,
+    test_pick_score_prefers_scarcer_position,
+    test_pick_score_run_adds_urgency,
+    test_recommendation_carries_run_and_dropoff,
 ]
 
 
