@@ -83,12 +83,17 @@ def _situation_text(session: DraftSession, rec: Recommendation) -> str:
     lines.append("")
     lines.append("SHORTLIST (engine-ranked; pick from these):")
     lines.append("name | pos | team | VORP | tier | players_left_in_tier | "
-                 "P(avail at your next pick) | #intervening_teams_needing_pos")
+                 "P(avail at your next pick) | #intervening_teams_needing_pos | "
+                 "scouting note")
     for c in rec.shortlist:
+        enr = getattr(c.player, "enrichment", None) or {}
+        note = ""
+        if enr.get("note"):
+            note = f"[{enr.get('flag', '?')}] {enr['note']}"
         lines.append(
             f"  {c.player.name} | {c.player.position} | {c.player.team or '-'} | "
             f"{c.vorp:.0f} | T{c.tier} | {c.players_left_in_tier} left | "
-            f"{c.p_available_next:.0%} | {c.needed_by_intervening}"
+            f"{c.p_available_next:.0%} | {c.needed_by_intervening} | {note}"
         )
     lines.append("")
     lines.append("Engine's provisional pick + reasoning (improve on it if "

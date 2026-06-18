@@ -54,7 +54,7 @@ def load_engine_players(conn: sqlite3.Connection) -> list[Player]:
     """
     rows = conn.execute(
         """SELECT player_id, full_name, position, team, bye_week, adp,
-                  search_rank, proj_points, proj_source
+                  search_rank, proj_points, proj_source, enrichment_json
            FROM players WHERE active=1
              AND position IN ('QB','RB','WR','TE','K','DEF')"""
     ).fetchall()
@@ -68,6 +68,12 @@ def load_engine_players(conn: sqlite3.Connection) -> list[Player]:
         for rank0, r in enumerate(plist):
             real = r["proj_source"] == "espn" and r["proj_points"] is not None
             proj = float(r["proj_points"]) if real else projections.project(pos, rank0)
+            enrichment = None
+            if r["enrichment_json"]:
+                try:
+                    enrichment = json.loads(r["enrichment_json"])
+                except (json.JSONDecodeError, TypeError):
+                    enrichment = None
             players.append(Player(
                 player_id=r["player_id"],
                 name=r["full_name"] or r["player_id"],
@@ -77,6 +83,7 @@ def load_engine_players(conn: sqlite3.Connection) -> list[Player]:
                 adp=float(r["adp"]) if r["adp"] is not None else 999.0,
                 proj_points=round(proj, 1),
                 proj_source="espn" if real else "placeholder",
+                enrichment=enrichment,
             ))
     return players
 

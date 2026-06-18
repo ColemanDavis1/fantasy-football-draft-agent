@@ -15,6 +15,7 @@ class Player:
     adp: float = 999.0            # lower = drafted earlier
     proj_points: float = 0.0      # season projection (real or fallback)
     proj_source: str = "placeholder"  # 'espn' (real) or 'placeholder'
+    enrichment: dict | None = None    # Phase 4 Claude pass: {note, flag, confidence}
     # computed by the engine:
     vorp: float | None = None
     tier: int | None = None       # per-position tier (1 = best)

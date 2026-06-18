@@ -17,7 +17,7 @@ import argparse
 import json
 import sys
 
-from . import board, config, db, ingest
+from . import board, config, db, enrich, ingest
 from .data import espn
 from .engine import tiers, vorp
 
@@ -202,6 +202,51 @@ def _print_detected_config(cfg: dict) -> None:
               "MY_TEAM_ID) to flag your team and compute your draft slot.")
 
 
+def cmd_enrich(args) -> int:
+    conn = db.connect()
+    db.init_db(conn)
+    try:
+        if args.collect:
+            res = enrich.collect(conn, wait=not args.no_wait)
+            if res["status"] != "ended":
+                print(f"Batch {res['batch_id']} status: {res['status']} "
+                      f"(not ready). Re-run `enrich --collect` later.")
+                conn.close()
+                return 0
+            print(f"Collected batch {res['batch_id']}: wrote {res['written']} "
+                  f"enrichment notes ({res.get('errored', 0)} errored).")
+        else:
+            if args.no_wait:
+                bid = enrich.submit(conn, limit=args.limit,
+                                    use_web_search=not args.no_web_search)
+                print(f"Submitted enrichment batch {bid} for top {args.limit} "
+                      f"players. Collect later with `enrich --collect`.")
+            else:
+                print(f"Submitting enrichment batch (top {args.limit}, "
+                      f"web search {'off' if args.no_web_search else 'on'}); "
+                      f"waiting for results (Batch API, ~minutes)...")
+                res = enrich.run(conn, limit=args.limit,
+                                 use_web_search=not args.no_web_search, wait=True)
+                if res.get("status") == "ended":
+                    print(f"Done: wrote {res['written']} notes "
+                          f"({res.get('errored', 0)} errored).")
+                else:
+                    print(f"Batch {res['batch_id']} still {res.get('status')}. "
+                          f"Collect later with `enrich --collect`.")
+    except RuntimeError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        conn.close()
+        return 1
+    except Exception as e:
+        print(f"ERROR running enrichment: {e}", file=sys.stderr)
+        conn.close()
+        return 1
+    cov = enrich.coverage(conn)
+    print(f"Enrichment coverage: {cov['enriched']}/{cov['total']} players.")
+    conn.close()
+    return 0
+
+
 def cmd_players(args) -> int:
     conn = db.connect()
     db.init_db(conn)
@@ -276,6 +321,10 @@ def cmd_status(args) -> int:
     if cov["total"]:
         print(f"  projection coverage:      {cov['real']}/{cov['total']} real, "
               f"{cov['placeholder']} placeholder")
+    print(f"  enrichment last collect:  {_fmt_age(conn, 'enrich_last_collected_at')}")
+    ecov = enrich.coverage(conn)
+    if ecov["total"]:
+        print(f"  enrichment coverage:      {ecov['enriched']}/{ecov['total']} players")
     for table in ("players", "trending", "league_settings", "teams",
                   "picks", "rosters", "opponent_profiles"):
         n = conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()["c"]
@@ -311,6 +360,17 @@ def build_parser() -> argparse.ArgumentParser:
     pj = sub.add_parser("projections", help="Pull real ESPN projections (league-scored)")
     add_league_args(pj)
     pj.set_defaults(func=cmd_projections)
+
+    pe = sub.add_parser("enrich", help="Night-before Claude enrichment pass (Batch API)")
+    pe.add_argument("--limit", type=int, default=150,
+                    help="how many top players to enrich (default 150)")
+    pe.add_argument("--no-web-search", action="store_true",
+                    help="skip the web_search tool (cheaper, less current)")
+    pe.add_argument("--no-wait", action="store_true",
+                    help="submit only; collect later with --collect")
+    pe.add_argument("--collect", action="store_true",
+                    help="fetch results for a previously submitted batch")
+    pe.set_defaults(func=cmd_enrich)
 
     pp = sub.add_parser("players", help="Peek at the loaded board")
     pp.add_argument("--pos", help="filter by position (QB/RB/WR/TE/K/DEF)")
