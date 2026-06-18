@@ -12,14 +12,26 @@ from dataclasses import dataclass, field
 
 from . import tiers, vorp
 from .draftflow import intervening_team_ids, next_pick_for_team
-from .models import DraftState, Player
-from .profiler import TeamProfile, profile_all, tendency_label
+from .models import DraftState, LeagueSettings, Player
+from .profiler import TeamProfile, compute_needs, profile_all, tendency_label
 from .survival import survival_probability
 
 # How much the cost of waiting (value lost if he's gone) boosts urgency.
 URGENCY_WEIGHT = 1.0
 # Extra urgency when a player is the last of a strong value tier (a 'cliff').
 TIER_CLIFF_BONUS = 0.15
+# Backup/depth value of a position once its starting slots are filled. Below 1
+# so a luxury pick never outranks a player who fills an open starting slot.
+_DEPTH_VALUE = {"RB": 0.55, "WR": 0.55, "TE": 0.30, "QB": 0.15, "K": 0.0, "DEF": 0.0}
+# Roster-construction ceilings: never draft beyond this many of a position
+# (keeps a shallow position from hoarding bench spots). QB raised for superflex.
+_POSITION_CAP = {"RB": 6, "WR": 7, "TE": 2, "K": 1, "DEF": 1}
+
+
+def _position_cap(position: str, league: LeagueSettings) -> int:
+    if position == "QB":
+        return 3 if league.is_superflex else 2
+    return _POSITION_CAP.get(position, 8)
 
 
 @dataclass
@@ -31,6 +43,8 @@ class Candidate:
     p_available_next: float
     pick_score: float
     needed_by_intervening: int  # how many intervening teams still need his pos
+    roster_fit: float = 1.0     # 1.0 fills an open starter; <1 luxury/depth
+    fills_need: bool = True     # does he fill one of MY open starting slots?
 
 
 @dataclass
@@ -50,8 +64,30 @@ def _needed_by_count(position: str, team_ids: list[int],
                if position in profiles[tid].needed_positions)
 
 
+def _roster_fit(player: Player, my_unfilled: dict[str, int],
+                my_needed: set[str], my_counts: dict[str, int],
+                league: LeagueSettings, current_overall: int) -> float:
+    """How much this player helps MY roster, in (0, 1]. 1.0 = fills an open
+    starting slot. Luxury depth is discounted; K/DEF are deferred to the late
+    rounds so they never crowd out players I still need to start."""
+    pos = player.position
+    if pos in ("K", "DEF"):
+        slot = "K" if pos == "K" else "D/ST"
+        empty = my_unfilled.get(slot, 0)
+        if empty <= 0:
+            return 0.02  # already have a starter; a 2nd is near-worthless
+        rounds_left = league.roster_size - ((current_overall - 1) // league.num_teams)
+        # Only worth taking in the last (empty + 1) rounds.
+        return 1.0 if rounds_left <= empty + 1 else 0.04
+    if pos in my_needed:
+        return 1.0  # fills an open starting slot (dedicated or FLEX)
+    depth = my_counts.get(pos, 0)
+    base = _DEPTH_VALUE.get(pos, 0.4)
+    return base * (0.65 ** max(0, depth - 2))  # diminishing returns on stacking
+
+
 def build_recommendation(state: DraftState, top_n: int = 5,
-                         shortlist_pool: int = 12) -> Recommendation:
+                         shortlist_pool: int = 30) -> Recommendation:
     # 1. Value + tiers over the FULL pool (stable baselines), then look at what's left.
     all_players = list(state.players_by_id.values())
     vorp.assign_vorp(all_players, state.league)
@@ -68,17 +104,37 @@ def build_recommendation(state: DraftState, top_n: int = 5,
     intervening = intervening_team_ids(state)
     my_next = next_pick_for_team(state, state.my_team_id, state.current_overall)
 
-    # 3. Score the top of the board.
-    pool = available[:shortlist_pool]
+    # 3. MY roster needs — so the pick fits my team, not just raw value.
+    my_roster = state.roster(state.my_team_id)
+    my_unfilled, my_needed = compute_needs(my_roster, state.league)
+    my_counts: dict[str, int] = {}
+    for p in my_roster:
+        my_counts[p.position] = my_counts.get(p.position, 0) + 1
+
+    # 4. Score the board (value x urgency x cliff, weighted by fit). Walk the
+    #    board in value order, skipping K/DEF that are deferred or already
+    #    backed up, so late bench picks go to the best skill player available
+    #    instead of a 4th kicker.
     candidates: list[Candidate] = []
-    for p in pool:
+    for p in available:
+        if len(candidates) >= shortlist_pool:
+            break
+        if my_counts.get(p.position, 0) >= _position_cap(p.position, state.league):
+            continue  # roster already full at this position
+        fit = _roster_fit(p, my_unfilled, my_needed, my_counts, state.league,
+                          state.current_overall)
+        if p.position in ("K", "DEF") and fit < 1.0:
+            continue  # defer until late / don't stockpile backups
         p_avail = survival_probability(p, state, available, profiles, intervening)
         left = tiers.players_left_in_tier(available, p)
         urgency = 1.0 - p_avail
         # Last-of-tier scarcity: full bonus at <=2 left, half at <=4, none beyond.
         cliff = 1.0 if left <= 2 else (0.5 if left <= 4 else 0.0)
         v = p.vorp or 0.0
-        score = v * (1.0 + URGENCY_WEIGHT * urgency) + TIER_CLIFF_BONUS * cliff * max(v, 0.0)
+        base = v * (1.0 + URGENCY_WEIGHT * urgency) + TIER_CLIFF_BONUS * cliff * max(v, 0.0)
+        # Apply fit only to positive scores so luxury/junk can't be promoted by
+        # multiplying a negative number toward zero.
+        score = base * fit if base > 0 else base
         candidates.append(Candidate(
             player=p,
             vorp=p.vorp or 0.0,
@@ -87,6 +143,10 @@ def build_recommendation(state: DraftState, top_n: int = 5,
             p_available_next=p_avail,
             pick_score=round(score, 2),
             needed_by_intervening=_needed_by_count(p.position, intervening, profiles),
+            roster_fit=round(fit, 2),
+            fills_need=(p.position in my_needed) if p.position not in ("K", "DEF")
+            else (my_unfilled.get("K" if p.position == "K" else "D/ST", 0) > 0
+                  and fit >= 1.0),
         ))
 
     candidates.sort(key=lambda c: c.pick_score, reverse=True)
@@ -134,7 +194,11 @@ def _rationale(primary: Candidate, shortlist: list[Candidate], state: DraftState
                 f"~{pct}% to return ({need_n}/{n_int} intervening teams need {p.position})."
             )
 
-    if primary.players_left_in_tier <= 2:
+    if not primary.fills_need:
+        parts.append("Depth/upside pick — your starting slots at this position "
+                     "are already set.")
+
+    if primary.players_left_in_tier <= 2 and primary.fills_need:
         parts.append(
             f"Tier cliff: only {primary.players_left_in_tier} left in {p.position} "
             f"tier {primary.tier}, so drafting now avoids the drop-off."

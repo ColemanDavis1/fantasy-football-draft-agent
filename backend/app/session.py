@@ -204,6 +204,8 @@ def _cand_to_dict(c) -> dict:
         "p_available_next": c.p_available_next,
         "pick_score": c.pick_score,
         "needed_by_intervening": c.needed_by_intervening,
+        "roster_fit": c.roster_fit,
+        "fills_need": c.fills_need,
     }
 
 
