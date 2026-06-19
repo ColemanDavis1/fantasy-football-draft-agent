@@ -113,6 +113,46 @@ class DraftSession:
                 "player_id": pid, "player_name": self.players_by_id[pid].name,
                 "confidence": confidence}
 
+    def reconcile(self, parsed: list[dict], overwrite: bool = False,
+                  source: str = "bulk") -> dict:
+        """Reconcile a parsed pick list against what we have. Fills missing
+        picks; with overwrite=True also corrects mismatches. Teams are inferred
+        from the overall via snake math (more reliable than a pasted team id).
+        Returns a summary incl. names we couldn't resolve."""
+        state = self.build_state()
+        n = self.league.num_teams
+        added = corrected = skipped = 0
+        unmatched: list[str] = []
+        for i, pk in enumerate(parsed):
+            overall = pk.get("overall")
+            if overall is None and pk.get("round") and pk.get("pick_in_round"):
+                overall = (pk["round"] - 1) * n + pk["pick_in_round"]
+            if overall is None:
+                overall = i + 1  # bare list -> sequential
+            pid, _conf = self.matcher.match(
+                None, pk.get("name"), pk.get("position"), pk.get("team"))
+            if pid is None or pid not in self.players_by_id:
+                unmatched.append(pk.get("name"))
+                continue
+            try:
+                team_id = team_id_for_overall(state, overall)
+            except (IndexError, ValueError):
+                team_id = pk.get("team_id") or 0
+            existing = self.picks.get(overall)
+            if existing is None:
+                self.add_pick(overall, int(team_id), pid, source)
+                added += 1
+            elif existing.player_id != pid:
+                if overwrite:
+                    self.add_pick(overall, int(team_id), pid, source)
+                    corrected += 1
+                else:
+                    skipped += 1
+            else:
+                skipped += 1
+        return {"parsed": len(parsed), "added": added, "corrected": corrected,
+                "skipped": skipped, "unmatched": unmatched}
+
     def remove_pick(self, overall: int) -> bool:
         existed = self.picks.pop(overall, None) is not None
         if self.league_id:

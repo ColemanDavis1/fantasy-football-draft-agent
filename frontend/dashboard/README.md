@@ -34,5 +34,12 @@ so the board loads the right teams.
   bye-week conflicts. This is the "what does each team still need, and how does
   that shape who they take" view.
 
-Data comes from `GET /state` and `GET /recommendation`; everything renders
-client-side. If the server isn't running, a banner says so.
+- **Paste picks to resync** (collapsible, bottom of the recommendation panel) —
+  the recovery backstop. If capture breaks, a tab restarts, or you're in a mock
+  room the tool isn't wired into, paste the board (from Claude in Chrome or
+  copied off ESPN) and the server fills any gaps. Loose formats accepted; teams
+  are inferred from snake-draft math. Safe anytime — state lives on the server,
+  so a restart loses nothing.
+
+Data comes from `GET /state`, `GET /recommendation`, and `POST /picks/bulk`;
+everything renders client-side. If the server isn't running, a banner says so.

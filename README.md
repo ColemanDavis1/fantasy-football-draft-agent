@@ -97,8 +97,20 @@ returns a recommendation; when it's **your** turn it adds Opus 4.8's reasoning
 over the engine shortlist (set `ANTHROPIC_API_KEY` in `.env`, or leave it unset
 for free no-LLM mode). A sync indicator + one-click correction back up the feed.
 
-Server endpoints: `/health`, `/state`, `/pick`, `/pick/correct`,
+Server endpoints: `/health`, `/state`, `/pick`, `/pick/correct`, `/picks/bulk`,
 `/recommendation`, `/sync`, `/session/reset` (interactive docs at `/docs`).
+
+**Recovery backstop (paste-to-resync).** If the live capture breaks (ESPN markup
+change), a tab restarts, or you're in a mock room the tool isn't wired into,
+paste the board into the dashboard's "Paste picks to resync" box (or POST text to
+`/picks/bulk`) and the server fills any gaps. It accepts loose formats —
+`overall | player | pos | team`, `12. Bijan Robinson, RB ATL`, `1.05 Chase WR CIN`,
+or bare names in order — resolves each to a player, infers the drafting team from
+snake-draft math, and only adds what's missing (`overwrite` also corrects
+mismatches). Because every pick lives in SQLite and the server rebuilds from it,
+**a tab/extension restart loses nothing** — resync at any point. This is also the
+landing spot for the optional Claude-in-Chrome path: have it read the board and
+emit a pick list, then paste it here.
 
 Verify the whole live loop without a browser or API key:
 
@@ -210,9 +222,10 @@ backend/
     data/
       sleeper.py     Sleeper client + disk cache
       espn.py        ESPN read-API client + config parser
-    server.py        Phase 3 FastAPI server (pick ingestion + recommendation)
-    session.py       live draft session: picks -> engine -> recommendation
+    server.py        Phase 3 FastAPI server (pick ingestion + recommendation + dashboard)
+    session.py       live draft session: picks -> engine -> recommendation; bulk reconcile
     match.py         resolve ESPN picks to our players (espn_id / name / D-ST)
+    bulk.py          parse a pasted board into picks (recovery/mock-draft backstop)
     llm.py           on-the-clock Opus 4.8 reasoning (prompt-cached, no-LLM fallback)
     board.py         DB rows -> engine models (shared by CLI + server)
     engine/          Phase 2 recommendation engine (pure functions)
@@ -229,6 +242,7 @@ backend/
     test_projections.py ESPN projection parse + board join (synthetic payload)
     test_enrich.py      enrichment JSON extraction + board join
     test_priors.py      draft-recap parse + cross-season owner priors
+    test_bulk.py        paste parser + reconcile (gaps/overwrite/unmatched)
     test_server_sim.py  end-to-end live-pipeline simulation (no browser/LLM)
   data_cache/        gitignored disk cache (regenerated on demand)
   draft.db           gitignored SQLite DB

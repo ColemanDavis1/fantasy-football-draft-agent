@@ -82,6 +82,16 @@
   #err { display:none; background:var(--bad,#3a1822); color:#ff7b9c; padding:8px 16px;
     border-bottom:1px solid #5a2230; font-size:12.5px; }
   #err.show { display:block; }
+  .resync { margin-top:12px; border-top:1px solid var(--line); padding-top:10px; }
+  .resync summary { cursor:pointer; color:var(--dim); font-size:12px; font-weight:600; }
+  .resync .hint { color:var(--dim); font-size:11px; line-height:1.5; }
+  .resync code { background:#10131a; padding:1px 4px; border-radius:4px; color:#cfd6e2; }
+  #pasteBox { width:100%; background:#10131a; color:var(--txt); border:1px solid var(--line);
+    border-radius:8px; padding:8px; font:12px/1.4 ui-monospace,Menlo,Consolas,monospace; resize:vertical; }
+  .resync-row { display:flex; align-items:center; gap:12px; margin-top:8px; }
+  .resync-row label { color:var(--dim); font-size:12px; }
+  .resync-result { margin-top:8px; font-size:12px; color:#cfd6e2; }
+  .resync-result .um { color:#ff9c6e; }
 </style>
 </head>
 <body>
@@ -110,6 +120,21 @@
         <span class="meta" id="aiState"></span>
       </div>
       <div class="rationale ai" id="aiRat" style="display:none"></div>
+
+      <details class="resync">
+        <summary>Paste picks to resync ▾</summary>
+        <p class="hint">Capture broke, restarted the tab, or in a mock the tool isn't wired to?
+        Paste the board (from Claude in Chrome, or copied off ESPN) — one pick per line —
+        and the server fills any gaps. Safe to do anytime; state lives on the server.
+        Formats: <code>overall | player | pos | team</code>, <code>12. Bijan Robinson, RB ATL</code>,
+        <code>1.05 Ja'Marr Chase WR CIN</code>, or just names in order.</p>
+        <textarea id="pasteBox" rows="6" placeholder="1 | Ja'Marr Chase | WR | CIN&#10;2. Bijan Robinson, RB ATL&#10;CeeDee Lamb"></textarea>
+        <div class="resync-row">
+          <label><input type="checkbox" id="overwrite"> also correct mismatches</label>
+          <button id="resyncBtn">Reconcile</button>
+        </div>
+        <div class="resync-result" id="resyncResult"></div>
+      </details>
     </div>
   </aside>
   <main>
@@ -255,6 +280,28 @@ $('aiBtn').addEventListener('click', async ()=>{
     renderRec(rec);
     $('aiState').textContent = rec.llm ? '' : 'no LLM (set ANTHROPIC_API_KEY)';
   }catch(e){ $('aiState').textContent='error'; }
+});
+
+// Bulk reconcile — paste a board, fill gaps. Resilient to restarts.
+$('resyncBtn').addEventListener('click', async ()=>{
+  const text = $('pasteBox').value.trim();
+  const out = $('resyncResult');
+  if(!text){ out.textContent='Paste some picks first.'; return; }
+  $('resyncBtn').disabled = true; out.textContent='reconciling…';
+  try{
+    const r = await fetch('/picks/bulk', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text, overwrite: $('overwrite').checked, use_llm:false}),
+    });
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const res = await r.json();
+    let msg = `Parsed ${res.parsed}: added ${res.added}, corrected ${res.corrected}, skipped ${res.skipped}.`;
+    if(res.unmatched && res.unmatched.length)
+      msg += ` <span class="um">Unmatched (${res.unmatched.length}): ${esc(res.unmatched.slice(0,8).join(', '))}${res.unmatched.length>8?'…':''}</span>`;
+    out.innerHTML = msg;
+    await tick();
+  }catch(e){ out.textContent = 'Reconcile failed: '+e.message; }
+  finally{ $('resyncBtn').disabled = false; }
 });
 
 tick();

@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from . import config, llm, session as session_mod
+from . import bulk as bulk_mod, config, llm, session as session_mod
 from .session import DraftSession, recommendation_to_dict
 
 app = FastAPI(title="Fantasy Draft Agent", version="0.1.0")
@@ -56,6 +56,12 @@ class PickIn(BaseModel):
 
 class CorrectIn(PickIn):
     overall: int                      # required for a correction
+
+
+class BulkIn(BaseModel):
+    text: str                         # pasted pick list (any supported shape)
+    overwrite: bool = False           # also correct existing mismatches
+    use_llm: bool = False             # recompute with LLM after reconcile
 
 
 # ---- dashboard (full-board live view) -----------------------------------
@@ -144,6 +150,18 @@ def correct_pick(pick: CorrectIn):
         source="manual",
     )
     return {"pick": result, "recommendation": _recommend_payload(s, pick.use_llm)}
+
+
+@app.post("/picks/bulk")
+def bulk_reconcile(body: BulkIn):
+    """Recovery backstop: paste a full/partial board (from Claude in Chrome or
+    copied off ESPN) and fill any gaps. Resilient to tab/extension restarts
+    since the server holds state — resync at any point."""
+    s = get_session()
+    parsed = bulk_mod.parse_picks(body.text)
+    summary = s.reconcile(parsed, overwrite=body.overwrite)
+    summary["recommendation"] = _recommend_payload(s, body.use_llm)
+    return summary
 
 
 @app.delete("/pick/{overall}")
