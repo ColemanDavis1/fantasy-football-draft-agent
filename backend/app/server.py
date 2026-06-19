@@ -82,6 +82,8 @@ class LiveContextIn(BaseModel):
     on_clock_overall: int | None = None    # the overall they're picking
     my_pick_overall: int | None = None     # overall I'm picking RIGHT NOW (my turn)
     my_next_overall: int | None = None     # my upcoming pick (from ESPN UI)
+    my_first_pick_in_round: int | None = None  # round-1 slot from pre-draft UI
+    pre_draft: bool = False
     num_teams: int | None = None           # live league size, if observed
     teams: list[dict] | None = None        # [{team_id, name, draft_slot}]
     pick_order: list[int] | None = None    # live draft-slot order of team_ids
@@ -125,6 +127,16 @@ def reset_session():
     return health()
 
 
+@app.post("/session/new-draft")
+def new_draft():
+    """Clear all picks + drafted memory for a fresh draft (pre-draft room)."""
+    global _session
+    s = get_session()
+    s.clear_all_picks()
+    rec = _recommend_payload(s, use_llm=False, expected_overall=1)
+    return {"ok": True, "picks_recorded": 0, "recommendation": rec}
+
+
 # ---- state + recommendation --------------------------------------------
 @app.get("/state")
 def state():
@@ -137,30 +149,48 @@ def sync(expected_overall: int | None = None):
 
 
 def _recommend_payload(s: DraftSession, use_llm: bool,
-                       expected_overall: int | None = None) -> dict:
+                       expected_overall: int | None = None,
+                       my_pick_overall: int | None = None) -> dict:
     sync = s.sync_status(expected_overall)
     synced = sync["in_sync"]
     server_turn = s.is_my_turn()
-    # ESPN's on-the-clock pick is the source of truth: only treat it as MY turn
-    # (and only spend an LLM call) once our recorded picks have caught up.
-    my_turn = server_turn and synced
+    # ESPN DOM says I'm on the clock at this pick (banner name match).
+    dom_my_turn = (my_pick_overall is not None and expected_overall is not None
+                   and my_pick_overall == expected_overall)
+    behind = max(0, (expected_overall or 0) - s.build_state().current_overall)
+    # Allow recommendations while on the clock even if we're a few picks behind.
+    my_turn = dom_my_turn or (server_turn and synced)
+    allow_rec = synced or dom_my_turn or behind <= 2
     rec = s.recommend()
     llm_out = None
-    if use_llm and my_turn:
+    if use_llm and my_turn and allow_rec:
         llm_out = llm.reason_on_the_clock(s, rec)
     payload = recommendation_to_dict(rec, llm_out)
     payload["is_my_turn"] = my_turn
     payload["on_the_clock"] = s.on_the_clock_team()
     payload["sync"] = sync
     payload["synced"] = synced
+    payload["my_slot"] = (s.my_slot_index + 1
+                          if s.my_slot_index is not None else None)
+    n = s.league.num_teams
+    payload["num_teams"] = n
+    payload["current_round"] = (rec.current_overall - 1) // n + 1 if n else None
     if expected_overall is not None:
         payload["expected_overall"] = expected_overall
-        payload["behind"] = max(0, expected_overall - rec.current_overall)
+        payload["behind"] = behind
     return payload
 
 
 @app.get("/recommendation")
-def recommendation(use_llm: bool = True, expected_overall: int | None = None):
+def recommendation(use_llm: bool = True, expected_overall: int | None = None,
+                   drafted_names: str | None = None,
+                   drafted_espn_ids: str | None = None):
+    s = get_session()
+    if drafted_names or drafted_espn_ids:
+        s.remember_drafted(
+            espn_ids=[x for x in (drafted_espn_ids or "").split("|") if x],
+            names=[x for x in (drafted_names or "").split("|") if x],
+        )
     return _recommend_payload(get_session(), use_llm, expected_overall)
 
 
@@ -196,8 +226,12 @@ def sync_picks(body: PickSyncIn):
     """Batch ingest structured picks (react state / fetch mirror). Faster than
     posting picks one-by-one when joining a draft mid-stream."""
     s = get_session()
-    # Mirror ESPN's DRAFTED board so the safety net is current before we score.
-    s.set_live_drafted(body.drafted_espn_ids, body.drafted_names)
+    # Merge ESPN board + any names from this batch into cumulative memory first.
+    pick_names = [pk["name"] for pk in body.picks if pk.get("name")]
+    s.remember_drafted(
+        espn_ids=body.drafted_espn_ids,
+        names=(body.drafted_names or []) + pick_names,
+    )
     n = s.league.num_teams
     added = corrected = skipped = unmatched = 0
     unmatched_names: list[str] = []
@@ -245,11 +279,15 @@ def sync_picks(body: PickSyncIn):
             corrected += 1
         elif not existing:
             added += 1
+    if body.expected_overall:
+        behind = body.expected_overall - s.build_state().current_overall
+        s.ensure_pick_count(body.expected_overall, max_gap=min(15, max(3, behind)))
     return {
         "added": added, "corrected": corrected, "skipped": skipped,
         "unmatched": unmatched, "unmatched_names": unmatched_names,
         "picks_recorded": len(s.picks),
-        "recommendation": _recommend_payload(s, body.use_llm, body.expected_overall),
+        "recommendation": _recommend_payload(
+            s, body.use_llm, body.expected_overall),
     }
 
 
@@ -265,12 +303,14 @@ def live_context(body: LiveContextIn):
         my_team_id=body.my_team_id, my_name=body.my_name,
         my_next_overall=body.my_next_overall,
         my_pick_overall=body.my_pick_overall, num_teams=body.num_teams,
+        my_first_pick_in_round=body.my_first_pick_in_round,
+        pre_draft=body.pre_draft,
     )
     if body.drafted_espn_ids is not None or body.drafted_names is not None:
         info["live_drafted"] = s.set_live_drafted(
             body.drafted_espn_ids, body.drafted_names)
-    info["recommendation"] = _recommend_payload(s, body.use_llm,
-                                                body.on_clock_overall)
+    info["recommendation"] = _recommend_payload(
+        s, body.use_llm, body.on_clock_overall, body.my_pick_overall)
     return info
 
 

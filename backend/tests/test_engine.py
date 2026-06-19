@@ -133,6 +133,27 @@ def test_pick_score_run_adds_urgency():
     assert with_run > base, (with_run, base)
 
 
+def test_roster_fit_rewards_upgrade_over_depth():
+    # At a position whose starting slots are filled, a player who beats my
+    # current worst starter (an upgrade) must outscore mere depth — and only the
+    # upgrade is flagged.
+    from app.engine.models import LeagueSettings, Player
+    from app.engine.recommend import _is_upgrade, _roster_fit
+    league = LeagueSettings(num_teams=12, starter_slots={
+        "QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1, "K": 1, "D/ST": 1})
+    # I hold two RBs: one strong (VORP 90), one weak (VORP 20). RB slots filled.
+    my_pos_vorps = {"RB": [90.0, 20.0]}
+    my_counts, my_needed, my_unfilled = {"RB": 2}, set(), {}
+    elite = Player("x", "Elite RB", "RB", vorp=100.0)   # beats my RB2 (20)
+    depth = Player("y", "Depth RB", "RB", vorp=10.0)    # behind both starters
+
+    fit_up = _roster_fit(elite, my_unfilled, my_needed, my_counts, league, 30, my_pos_vorps)
+    fit_dep = _roster_fit(depth, my_unfilled, my_needed, my_counts, league, 30, my_pos_vorps)
+    assert _is_upgrade(elite, my_needed, my_counts, league, my_pos_vorps) is True
+    assert _is_upgrade(depth, my_needed, my_counts, league, my_pos_vorps) is False
+    assert fit_up > fit_dep, (fit_up, fit_dep)
+
+
 def test_recommendation_carries_run_and_dropoff():
     rec = build_recommendation(build_sample_state())
     # New signals are populated on every candidate.
@@ -151,6 +172,7 @@ ALL_TESTS = [
     test_active_run_detection,
     test_pick_score_prefers_scarcer_position,
     test_pick_score_run_adds_urgency,
+    test_roster_fit_rewards_upgrade_over_depth,
     test_recommendation_carries_run_and_dropoff,
 ]
 

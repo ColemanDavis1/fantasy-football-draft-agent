@@ -93,6 +93,7 @@ class Candidate:
     needed_by_intervening: int  # how many intervening teams still need his pos
     roster_fit: float = 1.0     # 1.0 fills an open starter; <1 luxury/depth
     fills_need: bool = True     # does he fill one of MY open starting slots?
+    is_upgrade: bool = False    # would improve my starting lineup at his pos
     tier_dropoff: float = 0.0   # VORP cliff to the next tier at his position
     run_active: bool = False    # his position is in an active run
     run_count: int = 0          # his position's count in the recent window
@@ -115,12 +116,21 @@ def _needed_by_count(position: str, team_ids: list[int],
                if position in profiles[tid].needed_positions)
 
 
+def _starting_slots_for(position: str, league: LeagueSettings) -> int:
+    """How many dedicated starting slots my lineup has for this position
+    (FLEX excluded — it's handled by compute_needs' open-slot logic)."""
+    return int(league.starter_slots.get(position, 0))
+
+
 def _roster_fit(player: Player, my_unfilled: dict[str, int],
                 my_needed: set[str], my_counts: dict[str, int],
-                league: LeagueSettings, current_overall: int) -> float:
+                league: LeagueSettings, current_overall: int,
+                my_pos_vorps: dict[str, list[float]]) -> float:
     """How much this player helps MY roster, in (0, 1]. 1.0 = fills an open
-    starting slot. Luxury depth is discounted; K/DEF are deferred to the late
-    rounds so they never crowd out players I still need to start."""
+    starting slot. Once a position's slots are filled, value depends on the
+    SKILL already there: a clear upgrade over my current worst starter keeps
+    most of its value, while a backup behind strong starters is discounted.
+    K/DEF are deferred to the late rounds so they never crowd out starters."""
     pos = player.position
     if pos in ("K", "DEF"):
         slot = "K" if pos == "K" else "D/ST"
@@ -132,9 +142,38 @@ def _roster_fit(player: Player, my_unfilled: dict[str, int],
         return 1.0 if rounds_left <= empty + 1 else 0.04
     if pos in my_needed:
         return 1.0  # fills an open starting slot (dedicated or FLEX)
+
+    # Slots nominally filled: weigh him against the skill I already have there.
     depth = my_counts.get(pos, 0)
-    base = _DEPTH_VALUE.get(pos, 0.4)
-    return base * (0.65 ** max(0, depth - 2))  # diminishing returns on stacking
+    base = _DEPTH_VALUE.get(pos, 0.4) * (0.65 ** max(0, depth - 2))
+    cand_v = player.vorp or 0.0
+    starters = sorted(my_pos_vorps.get(pos, []), reverse=True)
+    n_start = _starting_slots_for(pos, league)
+    if starters and n_start >= 1:
+        worst_starter = starters[min(n_start, len(starters)) - 1]
+        if cand_v > worst_starter:
+            # Genuine upgrade — he'd bump my weakest starter to the bench.
+            # Scale toward a full-value pick by the size of the improvement.
+            boost = min(1.0, (cand_v - worst_starter) / 25.0)
+            return base + (1.0 - base) * boost
+    return base
+
+
+def _is_upgrade(player: Player, my_needed: set[str], my_counts: dict[str, int],
+                league: LeagueSettings, my_pos_vorps: dict[str, list[float]]) -> bool:
+    """True if he'd improve my STARTING lineup at his position (fills an open
+    slot, or out-values my current worst starter there)."""
+    pos = player.position
+    if pos in ("K", "DEF"):
+        return False
+    if pos in my_needed:
+        return True
+    starters = sorted(my_pos_vorps.get(pos, []), reverse=True)
+    n_start = _starting_slots_for(pos, league)
+    if not starters or n_start < 1:
+        return False
+    worst_starter = starters[min(n_start, len(starters)) - 1]
+    return (player.vorp or 0.0) > worst_starter
 
 
 def build_recommendation(state: DraftState, top_n: int = 5,
@@ -159,8 +198,12 @@ def build_recommendation(state: DraftState, top_n: int = 5,
     my_roster = state.roster(state.my_team_id)
     my_unfilled, my_needed = compute_needs(my_roster, state.league)
     my_counts: dict[str, int] = {}
+    # Skill already on my roster, per position: the VORPs of the players I hold
+    # there (best first). Lets the fit weigh an upgrade vs mere depth.
+    my_pos_vorps: dict[str, list[float]] = {}
     for p in my_roster:
         my_counts[p.position] = my_counts.get(p.position, 0) + 1
+        my_pos_vorps.setdefault(p.position, []).append(p.vorp or 0.0)
 
     # 4. Active positional runs (whole-league behavior over the recent window).
     runs = active_runs(state, window=RUN_WINDOW, threshold=RUN_THRESHOLD)
@@ -175,7 +218,7 @@ def build_recommendation(state: DraftState, top_n: int = 5,
         if my_counts.get(p.position, 0) >= _position_cap(p.position, state.league):
             continue  # roster already full at this position
         fit = _roster_fit(p, my_unfilled, my_needed, my_counts, state.league,
-                          state.current_overall)
+                          state.current_overall, my_pos_vorps)
         if p.position in ("K", "DEF") and fit < 1.0:
             continue  # defer until late / don't stockpile backups
 
@@ -198,6 +241,8 @@ def build_recommendation(state: DraftState, top_n: int = 5,
             fills_need=(p.position in my_needed) if p.position not in ("K", "DEF")
             else (my_unfilled.get("K" if p.position == "K" else "D/ST", 0) > 0
                   and fit >= 1.0),
+            is_upgrade=_is_upgrade(p, my_needed, my_counts, state.league,
+                                   my_pos_vorps),
             tier_dropoff=round(dropoff, 1),
             run_active=run_on,
             run_count=run_count,
@@ -233,11 +278,17 @@ def _rationale(primary: Candidate, shortlist: list[Candidate], state: DraftState
     is_best_value = all(primary.vorp >= c.vorp for c in shortlist)
     parts = [f"Take {p.name} ({tag})."]
 
-    # 1) Value + roster fit — the backbone of the call.
+    # 1) Value + roster fit — the backbone of the call, weighing what I already
+    #    have at the position (open slot vs upgrade vs depth).
     if primary.fills_need:
         lead = (f"Best value on the board and fills a starting {p.position} you "
                 f"still need" if is_best_value
                 else f"Fills a starting {p.position} you still need")
+    elif primary.is_upgrade:
+        lead = ("Best value left and an upgrade" if is_best_value
+                else "An upgrade")
+        lead += (f" at {p.position} — better than your current starter, who "
+                 f"slides to depth")
     else:
         lead = ("Best value left on the board" if is_best_value
                 else "Strong value here")

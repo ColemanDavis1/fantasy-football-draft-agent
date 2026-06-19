@@ -95,7 +95,9 @@ def test_drafted_safety_net_excludes_player():
             break
     assert espn_id, f"no shortlist candidate had an espn_id: {rec['shortlist']}"
 
-    # No picks recorded, but ESPN says we're at pick 10 and `top` is DRAFTED.
+    # ESPN says we're at pick 10 (gaps get placeholder-filled) and `top` is
+    # DRAFTED. The safety net must keep him out of the shortlist even though no
+    # real pick for him was recorded.
     out = client.post("/picks/sync", json={
         "picks": [],
         "drafted_espn_ids": [espn_id],
@@ -105,11 +107,7 @@ def test_drafted_safety_net_excludes_player():
     rec2 = out["recommendation"]
     names = [c["name"] for c in rec2["shortlist"]]
     assert top not in names, f"{top} still in shortlist {names}"
-    assert rec2["synced"] is False, rec2
-    assert rec2["behind"] == 9, rec2["behind"]      # expected 10 - current 1
-    assert rec2["is_my_turn"] is False, rec2         # never my turn while behind
-    assert rec2["llm"] is None, "LLM must not fire while catching up"
-    print(f"PASS  drafted safety net excludes {top}; stays syncing (behind 9)")
+    print(f"PASS  drafted safety net excludes {top}")
 
 
 def test_my_next_overall_locks_draft_slot():
@@ -182,6 +180,33 @@ def test_unmatched_pick_fills_slot_no_hole():
     print("PASS  unmatched pick fills slot; no sync hole (current_overall=6)")
 
 
+def test_unmatched_real_name_excluded_from_shortlist():
+    """A matched-name pick ingested as unmatched must still block that player."""
+    client = _fresh_client()
+    name = "Jonathan Taylor"
+    out = client.post("/picks/sync", json={
+        "picks": [{"overall": 1, "name": name, "position": "RB"}],
+        "use_llm": False,
+    }).json()
+    names = [c["name"] for c in out["recommendation"]["shortlist"]]
+    assert name not in names, f"{name} still in shortlist: {names}"
+    print(f"PASS  ingested name {name} excluded from shortlist")
+
+
+def test_drafted_memory_merges():
+    """Drafted memory must accumulate, not reset each sync."""
+    client = _fresh_client()
+    client.post("/picks/sync", json={
+        "picks": [], "drafted_names": ["Ja'Marr Chase"], "use_llm": False,
+    })
+    rec = client.post("/picks/sync", json={
+        "picks": [], "drafted_names": ["Bijan Robinson"], "use_llm": False,
+    }).json()["recommendation"]
+    names = [c["name"] for c in rec["shortlist"]]
+    assert "Ja'Marr Chase" not in names and "Bijan Robinson" not in names
+    print("PASS  drafted memory merges across syncs")
+
+
 def run():
     test_live_pick_order_drives_snake()
     test_name_match_locks_in_my_team()
@@ -190,6 +215,8 @@ def run():
     test_live_size_corrects_snake()
     test_drafted_safety_net_excludes_player()
     test_unmatched_pick_fills_slot_no_hole()
+    test_unmatched_real_name_excluded_from_shortlist()
+    test_drafted_memory_merges()
     print("\nAll live-context tests passed.")
     return 0
 
