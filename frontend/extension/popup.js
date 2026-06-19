@@ -22,14 +22,21 @@ async function tellContent(type, value) {
 }
 
 // Load saved settings.
-chrome.storage.sync.get(["serverUrl", "useLlm", "calibrate"], (cfg) => {
+chrome.storage.sync.get(["serverUrl", "useLlm", "calibrate", "myName"], (cfg) => {
   $("serverUrl").value = cfg.serverUrl || "http://localhost:8000";
   $("useLlm").checked = cfg.useLlm !== false;
   $("calibrate").checked = !!cfg.calibrate;
+  $("myName").value = cfg.myName || "";
 });
 
 $("serverUrl").addEventListener("change", () =>
   chrome.storage.sync.set({ serverUrl: $("serverUrl").value.trim() }));
+
+$("myName").addEventListener("change", () => {
+  const v = $("myName").value.trim();
+  chrome.storage.sync.set({ myName: v });
+  tellContent("popup:myName", v);
+});
 
 $("useLlm").addEventListener("change", () => {
   chrome.storage.sync.set({ useLlm: $("useLlm").checked });
@@ -46,9 +53,16 @@ $("check").addEventListener("click", async () => {
   const res = await bg("health");
   if (!res || !res.ok) { setStatus("Cannot reach server.\n" + (res && res.error), "warn"); return; }
   const d = res.data;
+  // Pull the detected live team name/slot from /state for confirmation.
+  let mine = "";
+  const st = await bg("state");
+  if (st && st.ok && st.data.teams) {
+    const me = st.data.teams.find((t) => t.is_me);
+    if (me) mine = ` (${me.name}${me.draft_slot ? ", slot " + me.draft_slot : ""})`;
+  }
   setStatus(
     `Connected.\nLeague: ${d.league_loaded ? "loaded" : "NOT loaded — run config"}\n` +
-    `My team: ${d.my_team_id ?? "unset"}\nPlayers: ${d.players_loaded}\n` +
+    `My team: ${d.my_team_id ?? "unset"}${mine}\nPlayers: ${d.players_loaded}\n` +
     `Picks: ${d.picks_recorded}\nAI: ${d.llm_available ? "available" : "no key (no-LLM mode)"}`,
     d.league_loaded ? "ok" : "warn");
 });

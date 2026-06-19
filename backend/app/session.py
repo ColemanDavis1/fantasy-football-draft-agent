@@ -8,12 +8,14 @@ only when it's MY turn (see server.py), per the cost model.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
 from . import board, db, priors
+from .match import normalize_name
 from .engine import tiers, vorp
-from .engine.draftflow import team_id_for_overall
+from .engine.draftflow import slot_index_for_overall, team_id_for_overall
 from .engine.models import DraftState, Pick
 from .engine.profiler import tendency_label
 from .engine.recommend import Recommendation, build_recommendation
@@ -22,6 +24,17 @@ from .match import PlayerMatcher
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+# Player_id stored for a pick we can't resolve to our board (usually a player
+# not in our fantasy-relevant pool). It occupies the overall slot so the pick
+# count + snake math stay aligned with ESPN, but it isn't in players_by_id, so
+# it never shows up in a roster or the available pool.
+_UNMATCHED_PREFIX = "__unmatched__"
+
+
+def _is_unmatched(player_id: str) -> bool:
+    return player_id.startswith(_UNMATCHED_PREFIX)
 
 
 class DraftSession:
@@ -45,29 +58,77 @@ class DraftSession:
         # Team display metadata (name/owner/draft slot) for the dashboard.
         self.team_meta = self._load_team_meta()
 
-        # Auto-size: for a public mock (no ESPN config) the league size isn't
-        # known up front, so we infer it from the picks themselves —
-        # num_teams = max(pick_in_round). Real ESPN leagues are authoritative
-        # (size + draft type come from mSettings), so we never override them.
-        self.auto_size = self.league_id in (None, "MOCK")
+        # My draft SLOT (0-based position in the order). This — not a team id —
+        # is what snake math needs, and it's what we learn live from the room
+        # (each time I'm on the clock). Seed it from any saved team id.
+        self.my_slot_index: int | None = None
+        if self.my_team_id is not None and self.my_team_id in self.draft_order:
+            self.my_slot_index = self.draft_order.index(self.my_team_id)
+
+        # Live size: the draft actually happening is the truth. We infer the
+        # team count from the picks (num_teams = picks-per-round) and adopt it,
+        # so a practice/mock draft — or any room whose size differs from saved
+        # config — gets the right snake math instead of a stale guess. Only
+        # trustworthy once a round-2 pick proves round 1 is complete.
         self._round1_max = 0          # largest pick_in_round seen in round 1
-        self._size_finalized = False  # set once a round-2 pick proves round 1's size
-        if self.auto_size:
-            self._infer_size_from_persisted()
+        self._size_finalized = False  # set once a round-2 pick proves the size
+        # Display hint: True once the size came from the live room rather than
+        # authoritative ESPN config (mock/practice drafts, or a size mismatch).
+        self.auto_size = self.league_id in (None, "MOCK")
+
+        # Live safety net (Phase 6): player_ids ESPN's board marks DRAFTED that
+        # we haven't ingested a pick for yet. Kept out of the shortlist so sync
+        # lag can't make us recommend an already-taken player. Not persisted —
+        # it's a transient mirror of the live UI. (Set before any build_state.)
+        self.live_drafted_ids: set[str] = set()
 
         # picks: overall -> Pick. Load any already persisted for this league.
         self.picks: dict[int, Pick] = {}
         self._load_persisted_picks()
+        self._infer_size_from_persisted()
 
-    def _set_num_teams(self, n: int) -> None:
-        """Resize the (mock) league and rebuild the draft order to 1..n."""
+    def _adopt_size(self, n: int) -> None:
+        """Set the live team count. If it differs from the current size, rebuild
+        the order to 1..n and re-attribute every recorded pick to the team that
+        owns its slot under the new size, so rosters stay coherent. My slot is
+        preserved and my team id re-derived from it."""
+        if n < 2 or n == self.league.num_teams:
+            return
+        self.auto_size = True  # size now reflects the live room, not config
         self.league.num_teams = n
         self.draft_order = list(range(1, n + 1))
+        # Re-attribute picks: a slot's owner changes when the size changes.
+        for o in sorted(self.picks):
+            pk = self.picks[o]
+            new_tid = team_id_for_overall(self.build_state(), o)
+            if new_tid != pk.team_id:
+                self.add_pick(o, int(new_tid), pk.player_id, "resize")
+        self._apply_my_slot()
+
+    def _apply_my_slot(self) -> None:
+        """Re-derive my team id from my draft slot under the current order."""
+        if self.my_slot_index is None:
+            return
+        if 0 <= self.my_slot_index < len(self.draft_order):
+            tid = self.draft_order[self.my_slot_index]
+            if tid != self.my_team_id:
+                self._set_my_team(tid)
+
+    def note_my_pick(self, overall: int) -> dict:
+        """Record that it's MY turn at this overall (observed live from the
+        room). Derives my draft slot — the reliable, self-correcting source of
+        identity — and re-derives my team id from it."""
+        slot = slot_index_for_overall(overall, self.league.num_teams)
+        changed = slot != self.my_slot_index
+        self.my_slot_index = slot
+        self._apply_my_slot()
+        return {"my_slot": slot + 1, "my_team_id": self.my_team_id,
+                "changed": changed}
 
     def _infer_size_from_persisted(self) -> None:
-        """On load, recover the inferred size from stored picks. Round 1's pick
-        count is the size, but only trustworthy once round 1 is complete — which
-        the presence of any round-2 pick proves."""
+        """Recover the inferred size from stored picks. Round 1's pick count is
+        the team count, trustworthy once round 1 is complete — which the
+        presence of any round-2 pick proves."""
         if not self.league_id:
             return
         has_r2 = self.conn.execute(
@@ -83,18 +144,19 @@ class DraftSession:
         if m:
             self._round1_max = int(m)
         if has_r2 and m:
-            self._set_num_teams(int(m))
+            self._adopt_size(int(m))
             self._size_finalized = True
 
     def _load_team_meta(self) -> dict[int, dict]:
         if not self.league_id:
             return {}
         rows = self.conn.execute(
-            "SELECT team_id, name, owner, draft_slot FROM teams "
+            "SELECT team_id, name, abbrev, owner, draft_slot FROM teams "
             "WHERE league_id=? AND season=?", (self.league_id, self.season),
         ).fetchall()
-        return {r["team_id"]: {"name": r["name"], "owner": r["owner"],
-                               "draft_slot": r["draft_slot"]} for r in rows}
+        return {r["team_id"]: {"name": r["name"], "abbrev": r["abbrev"],
+                               "owner": r["owner"], "draft_slot": r["draft_slot"]}
+                for r in rows}
 
     # ---- pick ingestion -------------------------------------------------
     def _load_persisted_picks(self) -> None:
@@ -143,16 +205,24 @@ class DraftSession:
         straight off the ESPN row) > next sequential. Deriving from round/pick
         keeps picks correctly ordered even if the DOM emits them out of order."""
         pid, confidence = self.matcher.match(espn_id, name, position, team)
-        # Auto-infer league size from the picks (public mocks). Round 1's pick
-        # count is the team count; we finalize it the moment a round-2 pick
-        # appears (proof round 1 is complete). Round-1 overalls equal
-        # pick_in_round regardless of size, so nothing computed before
-        # finalization is wrong.
-        if self.auto_size and round and pick_in_round and not self._size_finalized:
+        # Infer the live league size from the picks themselves so a practice/mock
+        # draft — or any room whose size differs from saved config — gets the
+        # right snake math. Two ways, most reliable first:
+        #   exact: a pick that carries overall + round + pick_in_round pins the
+        #          size at N = (overall - pick_in_round)/(round-1). Robust to
+        #          out-of-order/missing round-1 picks (ESPN's react feed).
+        #   count: a public mock with no overall — round 1's pick count is the
+        #          size, trusted once a round-2 pick proves round 1 is complete.
+        if round and pick_in_round and not self._size_finalized:
             if round == 1:
                 self._round1_max = max(self._round1_max, pick_in_round)
+            if overall and round >= 2:
+                span = overall - pick_in_round
+                if span % (round - 1) == 0 and span // (round - 1) >= 2:
+                    self._adopt_size(span // (round - 1))
+                    self._size_finalized = True
             elif round >= 2 and self._round1_max:
-                self._set_num_teams(self._round1_max)
+                self._adopt_size(self._round1_max)
                 self._size_finalized = True
         if overall is None and round and pick_in_round:
             overall = (round - 1) * self.league.num_teams + pick_in_round
@@ -161,8 +231,18 @@ class DraftSession:
         if team_id is None:
             team_id = team_id_for_overall(self.build_state(), overall)
         if pid is None or pid not in self.players_by_id:
+            # Occupy the slot with a placeholder so an unmatched pick (typically
+            # a player not on our board) can't leave a hole that makes us look
+            # behind ESPN. Don't overwrite a slot we've already resolved.
+            recorded = False
+            if overall is not None:
+                existing = self.picks.get(overall)
+                if existing is None or _is_unmatched(existing.player_id):
+                    ph = f"{_UNMATCHED_PREFIX}{espn_id or name or overall}"
+                    self.add_pick(overall, int(team_id), ph, source)
+                    recorded = True
             return {"ok": False, "reason": "unmatched", "overall": overall,
-                    "name": name, "confidence": confidence}
+                    "recorded": recorded, "name": name, "confidence": confidence}
         self.add_pick(overall, int(team_id), pid, source)
         return {"ok": True, "overall": overall, "team_id": int(team_id),
                 "player_id": pid, "player_name": self.players_by_id[pid].name,
@@ -223,13 +303,185 @@ class DraftSession:
 
     def build_state(self) -> DraftState:
         ordered = [self.picks[o] for o in sorted(self.picks)]
+        # Don't let the live-drafted safety net hide a player we've recorded a
+        # pick for (the recorded pick is authoritative for rosters).
+        recorded = {p.player_id for p in ordered}
         return DraftState(
             league=self.league,
             draft_order=self.draft_order,
             picks=ordered,
             my_team_id=self.my_team_id if self.my_team_id is not None else -1,
             players_by_id=self.players_by_id,
+            extra_drafted_ids=self.live_drafted_ids - recorded,
         )
+
+    # ---- live draft-room context ---------------------------------------
+    def set_live_drafted(self, espn_ids: list[str] | None = None,
+                         names: list[str] | None = None) -> int:
+        """Mirror ESPN's DRAFTED board into a safety-net set. Maps each ESPN id
+        or player name to our player id; unmapped entries are ignored."""
+        ids: set[str] = set()
+        for eid in (espn_ids or []):
+            pid, _ = self.matcher.match(espn_id=str(eid))
+            if pid in self.players_by_id:
+                ids.add(pid)
+        for name in (names or []):
+            pid, _ = self.matcher.match(name=name)
+            if pid in self.players_by_id:
+                ids.add(pid)
+        self.live_drafted_ids = ids
+        return len(ids)
+
+    def _match_team_by_name(self, name: str) -> int | None:
+        """Fuzzy-match a draft-room display string to a known team_id by
+        name/owner/abbrev. Exact matches win first so a substring (e.g. 'Team 1'
+        vs 'Team 12') can't shadow them. Returns None if nothing matches."""
+        target = normalize_name(name)
+        if not target:
+            return None
+
+        def cands(meta: dict) -> list[str]:
+            return [normalize_name(v or "") for v in
+                    (meta.get("name"), meta.get("owner"), meta.get("abbrev"))]
+
+        for tid, meta in self.team_meta.items():
+            if target in cands(meta):
+                return tid
+        # Fall back to a substring containment (handles "Coleman" vs
+        # "Coleman's Squad"), requiring a non-trivial overlap.
+        for tid, meta in self.team_meta.items():
+            for cand in cands(meta):
+                if len(cand) >= 3 and (cand in target or target in cand):
+                    return tid
+        return None
+
+    def _set_draft_order(self, order: list[int]) -> None:
+        self.draft_order = list(order)
+        self._size_finalized = True  # live order is authoritative; stop inferring
+        if self.league.num_teams != len(order):
+            self.league.num_teams = len(order)
+        if self.league_id:
+            self.conn.execute(
+                "UPDATE league_settings SET pick_order=? WHERE league_id=? AND season=?",
+                (json.dumps(list(order)), self.league_id, self.season))
+            self.conn.commit()
+
+    def _set_my_team(self, team_id: int) -> None:
+        self.my_team_id = int(team_id)
+        # Keep my slot in lockstep so identity survives a later size/order change.
+        if team_id in self.draft_order:
+            self.my_slot_index = self.draft_order.index(team_id)
+        if self.league_id:
+            self.conn.execute(
+                "UPDATE teams SET is_me=0 WHERE league_id=? AND season=?",
+                (self.league_id, self.season))
+            self.conn.execute(
+                "UPDATE teams SET is_me=1 WHERE league_id=? AND season=? AND team_id=?",
+                (self.league_id, self.season, int(team_id)))
+            self.conn.commit()
+
+    def _upsert_team_meta(self, teams: list[dict]) -> None:
+        for t in teams:
+            tid = t.get("team_id")
+            if tid is None:
+                continue
+            tid = int(tid)
+            meta = self.team_meta.setdefault(tid, {})
+            if t.get("name"):
+                meta["name"] = t["name"]
+            if t.get("draft_slot") is not None:
+                meta["draft_slot"] = t["draft_slot"]
+            if self.league_id:
+                self.conn.execute(
+                    """INSERT INTO teams (league_id, season, team_id, name, draft_slot)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(league_id, season, team_id) DO UPDATE SET
+                           name=COALESCE(excluded.name, teams.name),
+                           draft_slot=COALESCE(excluded.draft_slot, teams.draft_slot)""",
+                    (self.league_id, self.season, tid, t.get("name"),
+                     t.get("draft_slot")))
+        if self.league_id:
+            self.conn.commit()
+
+    def apply_live_context(self, on_clock_name: str | None = None,
+                           on_clock_overall: int | None = None,
+                           teams: list[dict] | None = None,
+                           pick_order: list[int] | None = None,
+                           my_team_id: int | None = None,
+                           my_name: str | None = None,
+                           my_next_overall: int | None = None,
+                           my_pick_overall: int | None = None,
+                           num_teams: int | None = None) -> dict:
+        """Reconcile live draft-room identity against saved config.
+
+        Identity is anchored to my DRAFT SLOT, learned from the room itself, so
+        snake math (who picks before me, what they have) is always right:
+        - my_pick_overall: the overall I'm picking RIGHT NOW (observed each time
+          I'm on the clock) — the strongest, self-correcting signal.
+        - my_next_overall: my upcoming pick highlighted on ESPN's draft strip.
+        - explicit my_team_id, or my name matched to the on-the-clock team.
+        Also adopts the room's live team count + pick order so a practice/mock
+        draft uses the real size, not stale config."""
+        result: dict = {"my_team_id_before": self.my_team_id}
+        if num_teams and num_teams >= 2:
+            self._adopt_size(int(num_teams))   # live room size wins
+        if teams:
+            self._upsert_team_meta(teams)
+        # Live pick order updates the ORDER (a same-length permutation). Size is
+        # learned from the picks themselves (more reliable), so we don't resize
+        # off a possibly-partial order scrape.
+        if pick_order:
+            order = [int(t) for t in pick_order if t is not None]
+            if (len(order) == self.league.num_teams and len(set(order)) == len(order)
+                    and list(order) != list(self.draft_order)):
+                self._set_draft_order(order)
+                self._apply_my_slot()
+                result["draft_order_updated"] = True
+
+        # Resolve my draft SLOT (0-based) from the strongest available signal.
+        n = self.league.num_teams
+        new_slot = None
+        if my_pick_overall is not None:
+            new_slot = slot_index_for_overall(int(my_pick_overall), n)
+        elif my_next_overall is not None:
+            new_slot = slot_index_for_overall(int(my_next_overall), n)
+            result["my_next_overall"] = int(my_next_overall)
+        elif my_team_id is not None and int(my_team_id) in self.draft_order:
+            new_slot = self.draft_order.index(int(my_team_id))
+        elif my_name and on_clock_name and normalize_name(my_name) \
+                and normalize_name(my_name) == normalize_name(on_clock_name) \
+                and on_clock_overall:
+            # I'm on the clock and the room shows my name → that slot is me.
+            new_slot = slot_index_for_overall(int(on_clock_overall), n)
+        else:
+            # Fuzzy name fallback → a team id, converted to a slot if we can.
+            fuzzy = None
+            if my_name and on_clock_name and normalize_name(my_name) \
+                    == normalize_name(on_clock_name):
+                fuzzy = self._match_team_by_name(on_clock_name)
+            elif my_name:
+                fuzzy = self._match_team_by_name(my_name)
+            if fuzzy is not None and fuzzy in self.draft_order:
+                new_slot = self.draft_order.index(fuzzy)
+
+        if new_slot is not None and 0 <= new_slot < n:
+            before = self.my_team_id
+            self.my_slot_index = new_slot
+            self._apply_my_slot()
+            if self.my_team_id != before:
+                result["my_team_id_updated"] = True
+
+        result["my_team_id"] = self.my_team_id
+        result["my_slot"] = (self.my_slot_index + 1
+                             if self.my_slot_index is not None else None)
+        result["num_teams"] = self.league.num_teams
+        result["on_clock_team"] = self._match_team_by_name(on_clock_name) \
+            if on_clock_name else None
+        result["draft_order"] = list(self.draft_order)
+        if "my_next_overall" not in result:
+            rec = self.recommend()
+            result["my_next_overall"] = rec.my_next_overall
+        return result
 
     def on_the_clock_team(self) -> int | None:
         state = self.build_state()
