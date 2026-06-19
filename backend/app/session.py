@@ -45,9 +45,46 @@ class DraftSession:
         # Team display metadata (name/owner/draft slot) for the dashboard.
         self.team_meta = self._load_team_meta()
 
+        # Auto-size: for a public mock (no ESPN config) the league size isn't
+        # known up front, so we infer it from the picks themselves —
+        # num_teams = max(pick_in_round). Real ESPN leagues are authoritative
+        # (size + draft type come from mSettings), so we never override them.
+        self.auto_size = self.league_id in (None, "MOCK")
+        self._round1_max = 0          # largest pick_in_round seen in round 1
+        self._size_finalized = False  # set once a round-2 pick proves round 1's size
+        if self.auto_size:
+            self._infer_size_from_persisted()
+
         # picks: overall -> Pick. Load any already persisted for this league.
         self.picks: dict[int, Pick] = {}
         self._load_persisted_picks()
+
+    def _set_num_teams(self, n: int) -> None:
+        """Resize the (mock) league and rebuild the draft order to 1..n."""
+        self.league.num_teams = n
+        self.draft_order = list(range(1, n + 1))
+
+    def _infer_size_from_persisted(self) -> None:
+        """On load, recover the inferred size from stored picks. Round 1's pick
+        count is the size, but only trustworthy once round 1 is complete — which
+        the presence of any round-2 pick proves."""
+        if not self.league_id:
+            return
+        has_r2 = self.conn.execute(
+            "SELECT 1 FROM picks WHERE league_id=? AND season=? AND round>=2 LIMIT 1",
+            (self.league_id, self.season),
+        ).fetchone()
+        row = self.conn.execute(
+            "SELECT MAX(pick_in_round) AS m FROM picks "
+            "WHERE league_id=? AND season=? AND round=1",
+            (self.league_id, self.season),
+        ).fetchone()
+        m = row["m"] if row else None
+        if m:
+            self._round1_max = int(m)
+        if has_r2 and m:
+            self._set_num_teams(int(m))
+            self._size_finalized = True
 
     def _load_team_meta(self) -> dict[int, dict]:
         if not self.league_id:
@@ -106,6 +143,17 @@ class DraftSession:
         straight off the ESPN row) > next sequential. Deriving from round/pick
         keeps picks correctly ordered even if the DOM emits them out of order."""
         pid, confidence = self.matcher.match(espn_id, name, position, team)
+        # Auto-infer league size from the picks (public mocks). Round 1's pick
+        # count is the team count; we finalize it the moment a round-2 pick
+        # appears (proof round 1 is complete). Round-1 overalls equal
+        # pick_in_round regardless of size, so nothing computed before
+        # finalization is wrong.
+        if self.auto_size and round and pick_in_round and not self._size_finalized:
+            if round == 1:
+                self._round1_max = max(self._round1_max, pick_in_round)
+            elif round >= 2 and self._round1_max:
+                self._set_num_teams(self._round1_max)
+                self._size_finalized = True
         if overall is None and round and pick_in_round:
             overall = (round - 1) * self.league.num_teams + pick_in_round
         if overall is None:
@@ -244,6 +292,7 @@ class DraftSession:
         return {
             "league_source": self.source,
             "num_teams": self.league.num_teams,
+            "size_inferred": self.auto_size,
             "starter_slots": self.league.starter_slots,
             "scoring_type": self.league.scoring_type,
             "is_superflex": self.league.is_superflex,

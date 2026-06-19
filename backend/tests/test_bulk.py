@@ -112,6 +112,80 @@ def test_reconcile_reports_unmatched():
     assert res["added"] == 1  # Chase still landed
 
 
+# ---- auto-size inference (public mocks) ---------------------------------
+def _mock_session(guess: int = 12) -> DraftSession:
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    now = "2026-06-18T00:00:00+00:00"
+    conn.execute(
+        """INSERT INTO league_settings(league_id, season, num_teams, scoring_type,
+               starter_slots, pick_order, updated_at)
+           VALUES ('MOCK', 2026, ?, 'ppr', ?, ?, ?)""",
+        (guess, json.dumps({"QB": 1, "RB": 2, "WR": 2, "TE": 1, "FLEX": 1}),
+         json.dumps(list(range(1, guess + 1))), now))
+    conn.executemany(
+        """INSERT INTO players(player_id, full_name, position, team, search_rank,
+               adp, active, updated_at) VALUES (?,?,?,?,?,?,1,?)""",
+        [("chase", "Ja'Marr Chase", "WR", "CIN", 1, 1.0, now),
+         ("bijan", "Bijan Robinson", "RB", "ATL", 2, 2.0, now),
+         ("lamb", "CeeDee Lamb", "WR", "DAL", 3, 3.0, now),
+         ("jjet", "Justin Jefferson", "WR", "MIN", 4, 4.0, now),
+         ("mahomes", "Patrick Mahomes", "QB", "KC", 5, 5.0, now)])
+    conn.commit()
+    return DraftSession(conn)
+
+
+def test_autosize_finalizes_on_first_round2_pick():
+    s = _mock_session(guess=12)
+    # A 4-team mock: round 1 has 4 picks. Size stays the guess until round 2.
+    s.ingest_pick(name="Ja'Marr Chase", position="WR", round=1, pick_in_round=1)
+    s.ingest_pick(name="Bijan Robinson", position="RB", round=1, pick_in_round=2)
+    s.ingest_pick(name="CeeDee Lamb", position="WR", round=1, pick_in_round=3)
+    s.ingest_pick(name="Justin Jefferson", position="WR", round=1, pick_in_round=4)
+    assert s.league.num_teams == 12, "size shouldn't finalize mid-round-1"
+    # Round-1 overalls equal pick_in_round regardless of size.
+    assert sorted(s.picks) == [1, 2, 3, 4], sorted(s.picks)
+
+    # First round-2 pick proves round 1 had 4 teams -> size = 4, overall = 5.
+    r = s.ingest_pick(name="Patrick Mahomes", position="QB", round=2, pick_in_round=1)
+    assert s.league.num_teams == 4, s.league.num_teams
+    assert r["overall"] == 5, r
+    assert s.draft_order == [1, 2, 3, 4]
+
+
+def test_autosize_recovers_from_persisted_picks():
+    s = _mock_session(guess=12)
+    for i, (nm, pos) in enumerate(
+            [("Ja'Marr Chase", "WR"), ("Bijan Robinson", "RB"),
+             ("CeeDee Lamb", "WR"), ("Justin Jefferson", "WR")], start=1):
+        s.ingest_pick(name=nm, position=pos, round=1, pick_in_round=i)
+    s.ingest_pick(name="Patrick Mahomes", position="QB", round=2, pick_in_round=1)
+    # A fresh session on the same DB should recover size=4 from stored picks.
+    s2 = DraftSession(s.conn)
+    assert s2.league.num_teams == 4, s2.league.num_teams
+
+
+def test_real_league_size_not_overridden():
+    # A real ESPN league (numeric id) is authoritative — never auto-sized.
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    now = "2026-06-18T00:00:00+00:00"
+    conn.execute(
+        """INSERT INTO league_settings(league_id, season, num_teams, scoring_type,
+               starter_slots, pick_order, updated_at)
+           VALUES ('555', 2026, 8, 'ppr', ?, ?, ?)""",
+        (json.dumps({"QB": 1, "RB": 2, "WR": 2}), json.dumps(list(range(1, 9))), now))
+    conn.execute(
+        """INSERT INTO players(player_id, full_name, position, team, search_rank,
+               adp, active, updated_at) VALUES ('chase','Ja''Marr Chase','WR','CIN',1,1.0,1,?)""",
+        (now,))
+    conn.commit()
+    s = DraftSession(conn)
+    assert s.auto_size is False
+    s.ingest_pick(name="Ja'Marr Chase", position="WR", round=2, pick_in_round=12)
+    assert s.league.num_teams == 8, "real league size must not change"
+
+
 ALL_TESTS = [
     test_parse_pipe_with_and_without_team_id,
     test_parse_numbered_and_parenthetical_and_bare,
@@ -121,6 +195,9 @@ ALL_TESTS = [
     test_reconcile_fills_only_gaps,
     test_reconcile_overwrite_corrects_mismatch,
     test_reconcile_reports_unmatched,
+    test_autosize_finalizes_on_first_round2_pick,
+    test_autosize_recovers_from_persisted_picks,
+    test_real_league_size_not_overridden,
 ]
 
 

@@ -271,11 +271,13 @@ def cmd_mock(args) -> int:
     conn.close()
     slot_msg = (f"your slot #{args.slot}" if args.slot
                 else "NO slot set - pass --slot once you see your draft position")
-    print(f"Mock league saved: {n} teams, {args.scoring}"
+    print(f"Mock league saved: {n}-team starting guess, {args.scoring}"
           f"{', superflex' if args.superflex else ''}, {slot_msg}.")
+    print("League SIZE auto-adjusts from the picks as they come in - you don't "
+          "need to get --teams right. Draft type is snake (the mock default).")
     print("Activate it now:  curl -X POST http://localhost:8000/session/reset")
     print("Then capture picks via the extension and/or paste the board into the "
-          "dashboard's resync box. Re-run `mock --slot N` anytime to fix your slot.")
+          "dashboard's resync box. Re-run `mock --slot N` anytime to set your slot.")
     return 0
 
 
@@ -455,7 +457,8 @@ def build_parser() -> argparse.ArgumentParser:
     pe.set_defaults(func=cmd_enrich)
 
     pm = sub.add_parser("mock", help="Configure a manual league for public mock drafts (no ESPN id)")
-    pm.add_argument("--teams", type=int, default=10, help="number of teams (default 10)")
+    pm.add_argument("--teams", type=int, default=12,
+                    help="starting guess for league size; auto-adjusts from picks (default 12)")
     pm.add_argument("--slot", type=int, help="your draft position, 1-based (set once you know it)")
     pm.add_argument("--scoring", choices=["ppr", "half_ppr", "standard"], default="ppr")
     pm.add_argument("--superflex", action="store_true")
