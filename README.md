@@ -174,6 +174,22 @@ curl -X POST http://localhost:8000/session/reset        # load the configured le
 Set `ANTHROPIC_API_KEY` in `.env` for on-the-clock reasoning + enrichment; leave
 it unset to run everything else at $0.
 
+### Public mock drafts (no ESPN league ID)
+
+Public mock lobbies aren't tied to a league, so there's nothing to auto-read.
+Configure a manual league instead so the engine is turn-aware, then drive it with
+the extension and/or the paste box:
+
+```bash
+python -m app.cli mock --teams 10 --slot 4 --scoring ppr   # set --slot once you see it
+curl -X POST http://localhost:8000/session/reset           # activate it
+```
+
+This writes a `MOCK` league (clean, zero picks) that supersedes any saved league.
+Re-run `mock --slot N` anytime to fix your draft position. Projections, enrichment,
+and priors are global player-board prep — load them once (via your real league ID)
+and they apply in mocks too.
+
 ### Refreshing later
 
 You won't draft for a while; data refreshes on demand. Just re-run

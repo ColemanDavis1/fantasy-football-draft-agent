@@ -247,6 +247,38 @@ def cmd_enrich(args) -> int:
     return 0
 
 
+def cmd_mock(args) -> int:
+    """Configure a manual league for a public mock lobby (no ESPN league ID).
+    Writes a 'MOCK' league that supersedes any saved league on the next
+    session reset — gives you a clean, turn-aware draft to test against."""
+    conn = db.connect()
+    db.init_db(conn)
+    n = args.teams
+    starters = dict(board.DEFAULT_SLOTS)
+    if args.superflex:
+        starters["OP"] = 1  # superflex slot (QB-eligible)
+    ppr = {"ppr": 1.0, "half_ppr": 0.5, "standard": 0.0}[args.scoring]
+    teams = [{"team_id": i, "name": f"Team {i}", "abbrev": None, "owner": None,
+              "draft_slot": i, "is_me": (args.slot == i)} for i in range(1, n + 1)]
+    cfg = {
+        "league_id": "MOCK", "season": config.current_nfl_season(),
+        "name": "Public Mock", "num_teams": n, "scoring_type": args.scoring,
+        "ppr_value": ppr, "is_superflex": args.superflex, "draft_type": "SNAKE",
+        "roster_slots": {**starters, "BE": 7}, "starter_slots": starters,
+        "pick_order": list(range(1, n + 1)), "teams": teams,
+    }
+    ingest.save_league_config(conn, cfg)
+    conn.close()
+    slot_msg = (f"your slot #{args.slot}" if args.slot
+                else "NO slot set - pass --slot once you see your draft position")
+    print(f"Mock league saved: {n} teams, {args.scoring}"
+          f"{', superflex' if args.superflex else ''}, {slot_msg}.")
+    print("Activate it now:  curl -X POST http://localhost:8000/session/reset")
+    print("Then capture picks via the extension and/or paste the board into the "
+          "dashboard's resync box. Re-run `mock --slot N` anytime to fix your slot.")
+    return 0
+
+
 def cmd_priors(args) -> int:
     conn = db.connect()
     db.init_db(conn)
@@ -421,6 +453,13 @@ def build_parser() -> argparse.ArgumentParser:
     pe.add_argument("--collect", action="store_true",
                     help="fetch results for a previously submitted batch")
     pe.set_defaults(func=cmd_enrich)
+
+    pm = sub.add_parser("mock", help="Configure a manual league for public mock drafts (no ESPN id)")
+    pm.add_argument("--teams", type=int, default=10, help="number of teams (default 10)")
+    pm.add_argument("--slot", type=int, help="your draft position, 1-based (set once you know it)")
+    pm.add_argument("--scoring", choices=["ppr", "half_ppr", "standard"], default="ppr")
+    pm.add_argument("--superflex", action="store_true")
+    pm.set_defaults(func=cmd_mock)
 
     pp2 = sub.add_parser("priors", help="Seed opponent priors from past drafts (mDraftDetail)")
     add_league_args(pp2)
