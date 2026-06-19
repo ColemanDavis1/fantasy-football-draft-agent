@@ -46,12 +46,22 @@
     const m = ev.data;
     if (!m || m.__ffda !== true || m.kind !== "ws") return;
     const p = m.payload;
+    // Calibration: confirm the socket was even seen. If you see an "ws OPEN"
+    // line, inject.js wrapped the draft-room socket; if you then see "ws frame"
+    // lines as picks happen, the websocket path is viable — copy a frame here so
+    // the parser can be tuned to ESPN's real schema. No OPEN line at all => the
+    // socket isn't on the main thread (worker/other transport) => use the DOM.
+    if (state.calibrate && p.event === "open") log("ws OPEN", p.url);
     if (p.event !== "message") return;
     let obj;
-    try { obj = JSON.parse(p.data); } catch (e) { return; }
+    try { obj = JSON.parse(p.data); } catch (e) {
+      if (state.calibrate) log("ws non-JSON frame", String(p.data).slice(0, 200));
+      return;
+    }
     if (state.calibrate) log("ws frame", obj);
     const pick = parseWsPick(obj);
     if (pick) handlePick(pick, "websocket");
+    else if (state.calibrate) log("ws frame did NOT parse as a pick (schema?)");
   });
 
   // Best-effort: recursively find a node that looks like a completed pick.
