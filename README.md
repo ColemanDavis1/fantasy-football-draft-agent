@@ -177,18 +177,20 @@ it unset to run everything else at $0.
 ### Public mock drafts (no ESPN league ID)
 
 Public mock lobbies aren't tied to a league, so there's nothing to auto-read.
-Configure a manual league instead so the engine is turn-aware, then drive it with
-the extension and/or the paste box:
+Configure a manual mock and the only thing you supply is **your draft slot** —
+league **size auto-detects from the picks** (round 1's pick count, finalized the
+moment a round-2 pick appears), and draft type is snake (the mock default):
 
 ```bash
-python -m app.cli mock --teams 10 --slot 4 --scoring ppr   # set --slot once you see it
-curl -X POST http://localhost:8000/session/reset           # activate it
+python -m app.cli mock --slot 4              # --teams is just a starting guess; it self-adjusts
+curl -X POST http://localhost:8000/session/reset
 ```
 
 This writes a `MOCK` league (clean, zero picks) that supersedes any saved league.
-Re-run `mock --slot N` anytime to fix your draft position. Projections, enrichment,
+Re-run `mock --slot N` anytime to set your draft position. Projections, enrichment,
 and priors are global player-board prep — load them once (via your real league ID)
-and they apply in mocks too.
+and they apply in mocks too. (Real ESPN leagues stay authoritative: size and draft
+type come straight from `mSettings`, never inferred.)
 
 ### Refreshing later
 
