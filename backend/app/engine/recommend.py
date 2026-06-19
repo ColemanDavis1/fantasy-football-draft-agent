@@ -18,9 +18,10 @@ from .profiler import (TeamProfile, active_runs, compute_needs, profile_all,
 from .survival import survival_probability
 
 # Scoring weights (all terms are in VORP units, so cross-position comparable).
-WAIT_WEIGHT = 0.6      # value at risk if he won't survive to my next pick
-CLIFF_WEIGHT = 0.8     # value lost to the positional tier cliff (scarcity)
-RUN_SCARCITY_BOOST = 0.5   # an active run amplifies that position's scarcity
+# Raw value (VORP) is the backbone; the urgency term is a bounded adjustment so
+# a clearly better player is never passed over for a marginally scarcer one.
+URGENCY_WEIGHT = 0.8       # how hard to weight value-at-risk vs raw value
+RUN_SCARCITY_BOOST = 0.5   # an active run amplifies that position's urgency
 RUN_FLAT_BONUS = 0.08      # ...plus a flat nudge to grab the running position
 
 # Positional-run detection.
@@ -54,25 +55,28 @@ def _scarcity_factor(tier_remaining: int) -> float:
 
 def pick_score(vorp: float, p_available: float, tier_remaining: int,
                dropoff: float, run_active: bool, fit: float) -> float:
-    """Pure scoring function (unit-tested). All bonuses are in VORP units so
-    they compare fairly across positions:
+    """Pure scoring function (unit-tested). Value-first by design:
 
-      value      = VORP (baseline worth)
-      wait_cost  = value you'd lose if he won't return to you  (survival)
-      scarcity   = value you'd lose to the tier cliff at his position, scaled
-                   by how few remain  (cross-position: 1 RB left before a big
-                   drop beats 3 WRs in a flat tier)
-      run_extra  = amplifies scarcity + a flat nudge when his position is
-                   actively running
+      value    = VORP — the backbone, so the best player available leads.
+      urgency  = the value you actually lose by WAITING, not the player's whole
+                 worth: P(he's gone) x the cliff to your fallback at his
+                 position, amplified when his tier is nearly empty. This is what
+                 makes "take the scarce guy now" fire only when the drop is real
+                 AND he likely won't return — never just because everyone needs
+                 the position.
+      run_extra = amplifies urgency + a flat nudge when his position is running.
 
-    Then weighted by roster fit (luxury/depth discounted).
+    Then weighted by roster fit (luxury/depth discounted). Because urgency is
+    capped by the actual tier dropoff (not VORP), a meaningfully higher-value
+    player is not leapfrogged by a lower-value one on survival alone.
     """
     v = vorp
-    wait_cost = (1.0 - p_available) * max(v, 0.0)
-    scarcity = _scarcity_factor(tier_remaining) * max(dropoff, 0.0)
-    run_extra = (RUN_SCARCITY_BOOST * scarcity + RUN_FLAT_BONUS * max(v, 0.0)) \
+    # The cliff to your realistic fallback, weighted up as the tier empties.
+    cliff = max(dropoff, 0.0) * (0.5 + 0.5 * _scarcity_factor(tier_remaining))
+    urgency = (1.0 - p_available) * cliff
+    run_extra = (RUN_SCARCITY_BOOST * urgency + RUN_FLAT_BONUS * max(v, 0.0)) \
         if run_active else 0.0
-    base = v + WAIT_WEIGHT * wait_cost + CLIFF_WEIGHT * scarcity + run_extra
+    base = v + URGENCY_WEIGHT * urgency + run_extra
     # Apply fit only to positive scores so luxury/junk isn't promoted by
     # multiplying a negative number toward zero.
     return base * fit if base > 0 else base
@@ -217,71 +221,67 @@ def build_recommendation(state: DraftState, top_n: int = 5,
 
 def _rationale(primary: Candidate, shortlist: list[Candidate], state: DraftState,
                profiles: dict[int, TeamProfile], intervening: list[int]) -> str:
+    """Plain-language case for the pick: value first, then fit, then timing.
+    Built so the reasoning reads like a GM weighing the best player against
+    roster need and what's likely to happen before the next pick — not a survival
+    readout."""
     p = primary.player
     n_int = len(intervening)
     need_n = primary.needed_by_intervening
-    parts = [
-        f"Take {p.name} ({p.position}"
-        + (f"-{p.team}" if p.team else "") + ")."
-    ]
-    parts.append(f"VORP {primary.vorp:.0f}, tier {primary.tier}.")
+    pct = round(primary.p_available_next * 100)
+    tag = f"{p.position}-{p.team}" if p.team else p.position
+    is_best_value = all(primary.vorp >= c.vorp for c in shortlist)
+    parts = [f"Take {p.name} ({tag})."]
 
-    if n_int == 0:
-        parts.append("You pick back-to-back at the turn, so secure the higher-value player now.")
+    # 1) Value + roster fit — the backbone of the call.
+    if primary.fills_need:
+        lead = (f"Best value on the board and fills a starting {p.position} you "
+                f"still need" if is_best_value
+                else f"Fills a starting {p.position} you still need")
     else:
-        pct = round(primary.p_available_next * 100)
-        if primary.p_available_next < 0.45:
-            parts.append(
-                f"Only ~{pct}% to return: {need_n} of the {n_int} teams before "
-                f"your next pick still need {p.position}, so he won't get back to you."
-            )
-        elif primary.p_available_next > 0.75:
-            parts.append(
-                f"~{pct}% to survive to your next pick, but his value leads the board now."
-            )
+        lead = ("Best value left on the board" if is_best_value
+                else "Strong value here")
+        lead += f"; your {p.position} starters are set, so this is depth/upside"
+    parts.append(f"{lead} (VORP {primary.vorp:.0f}).")
+
+    # 2) Timing — will he come back to you, given who picks in between?
+    if n_int == 0:
+        parts.append("You pick back-to-back at the turn, so take the higher-value "
+                     "player here and grab the next on the way back.")
+    elif primary.p_available_next < 0.45:
+        if need_n and need_n >= max(2, n_int - 1):
+            thin = f"; nearly every team ahead of you is thin at {p.position}"
+        elif need_n:
+            thin = (f"; {need_n} of the {n_int} teams ahead of you need "
+                    f"{p.position}")
         else:
-            parts.append(
-                f"~{pct}% to return ({need_n}/{n_int} intervening teams need {p.position})."
-            )
+            thin = ""
+        parts.append(f"He won't make it back to your next pick (~{pct}% to "
+                     f"survive the {n_int} picks until you're up again{thin}), "
+                     f"so lock him in now.")
+    elif primary.p_available_next > 0.75:
+        parts.append(f"He'd likely still be here at your next pick (~{pct}%), but "
+                     f"he's the best value on the board, so there's no edge in "
+                     f"waiting.")
+    else:
+        parts.append(f"Roughly a coin flip to return (~{pct}% over the next "
+                     f"{n_int} picks) — the value justifies taking him now.")
 
-    if not primary.fills_need:
-        parts.append("Depth/upside pick - your starting slots at this position "
-                     "are already set.")
-
+    # 3) Scarcity / run — only when the drop is real.
     if primary.run_active:
-        parts.append(
-            f"{p.position} RUN: {primary.run_count} of the last {RUN_WINDOW} "
-            f"picks were {p.position} - the position is thinning fast."
-        )
+        parts.append(f"There's a {p.position} run on ({primary.run_count} of the "
+                     f"last {RUN_WINDOW} picks), thinning the tier fast.")
+    elif primary.players_left_in_tier <= 2 and primary.tier_dropoff > 0:
+        parts.append(f"Only {primary.players_left_in_tier} left at {p.position} "
+                     f"before a {primary.tier_dropoff:.0f}-pt drop, so the value "
+                     f"won't hold.")
 
-    # Cross-position scarcity: few left at his position before a real drop, while
-    # a comparable-value alternative sits in a deeper position that can wait.
-    if (primary.fills_need and primary.players_left_in_tier <= 2
-            and primary.tier_dropoff > 0):
-        deeper = next((c for c in shortlist[1:]
-                       if c.player.position != p.position
-                       and c.players_left_in_tier >= 3
-                       and c.vorp >= primary.vorp - 10), None)
-        if deeper:
-            parts.append(
-                f"Scarcity: only {primary.players_left_in_tier} {p.position} left "
-                f"before a {primary.tier_dropoff:.0f}-pt drop, while "
-                f"{deeper.player.position} is {deeper.players_left_in_tier}-deep "
-                f"at similar value - take the {p.position} and let the "
-                f"{deeper.player.position} come back."
-            )
-        else:
-            parts.append(
-                f"Tier cliff: only {primary.players_left_in_tier} left in "
-                f"{p.position} tier {primary.tier} before a "
-                f"{primary.tier_dropoff:.0f}-pt drop - draft now."
-            )
-
-    # Contrast with the safest high-value alternative that WILL likely return.
-    safe = next((c for c in shortlist[1:] if c.p_available_next > 0.7), None)
+    # 4) Point at a strong alternative that can safely wait (preferably a deeper
+    #    position), so the user sees the trade-off, not just the pick.
+    safe = next((c for c in shortlist[1:]
+                 if c.p_available_next > 0.7 and c.player.position != p.position),
+                None)
     if safe:
-        parts.append(
-            f"{safe.player.name} ({safe.player.position}) projects to return "
-            f"(~{round(safe.p_available_next*100)}%), so he can wait."
-        )
+        parts.append(f"{safe.player.name} ({safe.player.position}) should still "
+                     f"be there next time, so he can wait.")
     return " ".join(parts)

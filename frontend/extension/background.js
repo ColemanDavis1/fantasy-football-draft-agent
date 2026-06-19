@@ -34,10 +34,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             body: JSON.stringify(msg.pick),
           }) });
           break;
-        case "recommendation":
-          sendResponse({ ok: true, data: await call(
-            "/recommendation?use_llm=" + (msg.useLlm ? "true" : "false")) });
+        case "recommendation": {
+          let path = "/recommendation?use_llm=" + (msg.useLlm ? "true" : "false");
+          if (msg.expectedOverall) path += "&expected_overall=" + msg.expectedOverall;
+          sendResponse({ ok: true, data: await call(path) });
           break;
+        }
         case "state":
           sendResponse({ ok: true, data: await call("/state") });
           break;
@@ -49,6 +51,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           break;
         case "reset":
           sendResponse({ ok: true, data: await call("/session/reset", { method: "POST" }) });
+          break;
+        case "syncPicks":
+          sendResponse({ ok: true, data: await call("/picks/sync", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              picks: msg.picks, use_llm: msg.useLlm,
+              expected_overall: msg.expectedOverall || null,
+              drafted_espn_ids: msg.draftedEspnIds || null,
+              drafted_names: msg.draftedNames || null,
+            }),
+          }) });
+          break;
+        case "liveContext":
+          sendResponse({ ok: true, data: await call("/session/live-context", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(msg.context),
+          }) });
           break;
         default:
           sendResponse({ ok: false, error: "unknown message type" });

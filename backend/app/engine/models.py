@@ -44,6 +44,10 @@ class DraftState:
     picks: list[Pick]              # picks made so far, in order
     my_team_id: int
     players_by_id: dict[str, Player] = field(default_factory=dict)
+    # Safety net: player_ids ESPN's UI marks DRAFTED but we haven't recorded a
+    # pick for yet (sync lag). Excluded from available() so a drafted player can
+    # never surface in the shortlist even before his pick lands.
+    extra_drafted_ids: set[str] = field(default_factory=set)
 
     @property
     def num_teams(self) -> int:
@@ -59,7 +63,7 @@ class DraftState:
         return {p.player_id for p in self.picks}
 
     def available(self) -> list[Player]:
-        drafted = self.drafted_ids
+        drafted = self.drafted_ids | self.extra_drafted_ids
         return [p for p in self.players_by_id.values() if p.player_id not in drafted]
 
     def roster_player_ids(self, team_id: int) -> list[str]:
