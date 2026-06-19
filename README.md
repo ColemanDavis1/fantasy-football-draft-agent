@@ -29,7 +29,7 @@ Everything else (data, profiling, survival math) is deterministic and free.
 | **2** | Recommendation engine (offline): VORP, tiers + cliff detection, opponent profiler, opponent-aware survival probability | ✅ done |
 | **3** | Live capture: browser extension (websocket-preferred, DOM fallback), turn detection, on-page recommendation overlay, FastAPI server, on-the-clock LLM (Opus 4.8) with no-LLM fallback, sync indicator + one-click correction | ✅ done |
 | **4** | Pre-draft enrichment: real ESPN projections (`kona_player_info`, league-scored), batched Claude scouting pass (sleeper/bust flags), historical opponent priors via ESPN `mDraftDetail` | ✅ done |
-| 5 | (optional) Claude-in-Chrome capture path + full local dashboard | planned |
+| **5** | Full local dashboard (live full-board view, served by the server) ✅ done · Claude-in-Chrome capture path — planned | partial |
 
 ## Quickstart (Phase 1)
 
@@ -155,6 +155,8 @@ uvicorn app.server:app --port 8000                      # start the local server
 curl -X POST http://localhost:8000/session/reset        # load the configured league
 # Load frontend/extension/ in Chrome (Developer mode -> Load unpacked), open your
 # ESPN draft, and watch the overlay. Click your pick when prompted — that's it.
+# Optional full-board view: open http://localhost:8000/ in another tab — every
+# team's roster, needs, tendencies, and your recommendation, live each pick.
 ```
 
 Set `ANTHROPIC_API_KEY` in `.env` for on-the-clock reasoning + enrichment; leave
@@ -231,6 +233,8 @@ backend/
   data_cache/        gitignored disk cache (regenerated on demand)
   draft.db           gitignored SQLite DB
 frontend/
+  dashboard/         full-board live view, served by the server at / (Phase 5)
+    index.html       self-contained dashboard (polls /state + /recommendation)
   extension/         Chrome MV3 extension: capture + overlay (Phase 3)
     manifest.json    MV3 config
     inject.js        page-context WebSocket interceptor (MAIN world)

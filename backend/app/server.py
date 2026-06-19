@@ -14,12 +14,15 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import config, llm, session as session_mod
 from .session import DraftSession, recommendation_to_dict
 
 app = FastAPI(title="Fantasy Draft Agent", version="0.1.0")
+
+_DASHBOARD = config.REPO_ROOT / "frontend" / "dashboard" / "index.html"
 
 # Local advisory tool: the extension runs on the ESPN page and calls localhost.
 app.add_middleware(
@@ -53,6 +56,15 @@ class PickIn(BaseModel):
 
 class CorrectIn(PickIn):
     overall: int                      # required for a correction
+
+
+# ---- dashboard (full-board live view) -----------------------------------
+@app.get("/")
+@app.get("/dashboard")
+def dashboard():
+    """Serve the local full-board dashboard (Phase 5). Open
+    http://localhost:8000/ — it polls /state and /recommendation live."""
+    return FileResponse(_DASHBOARD)
 
 
 # ---- lifecycle ----------------------------------------------------------

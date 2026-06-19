@@ -42,9 +42,22 @@ class DraftSession:
         # pick 1. Live picks refine the picture as the draft unfolds.
         self.priors = priors.load_priors(conn, self.league_id, self.season)
 
+        # Team display metadata (name/owner/draft slot) for the dashboard.
+        self.team_meta = self._load_team_meta()
+
         # picks: overall -> Pick. Load any already persisted for this league.
         self.picks: dict[int, Pick] = {}
         self._load_persisted_picks()
+
+    def _load_team_meta(self) -> dict[int, dict]:
+        if not self.league_id:
+            return {}
+        rows = self.conn.execute(
+            "SELECT team_id, name, owner, draft_slot FROM teams "
+            "WHERE league_id=? AND season=?", (self.league_id, self.season),
+        ).fetchall()
+        return {r["team_id"]: {"name": r["name"], "owner": r["owner"],
+                               "draft_slot": r["draft_slot"]} for r in rows}
 
     # ---- pick ingestion -------------------------------------------------
     def _load_persisted_picks(self) -> None:
@@ -154,16 +167,20 @@ class DraftSession:
     def state_summary(self) -> dict:
         state = self.build_state()
         vorp.assign_vorp(list(self.players_by_id.values()), self.league)
-        from .engine.profiler import profile_all
+        from .engine.profiler import active_runs, profile_all
         profiles = profile_all(state)
         teams = []
         for tid in self.draft_order:
             prof = profiles[tid]
+            meta = self.team_meta.get(tid, {})
             roster = [{"name": p.name, "pos": p.position, "team": p.team,
                        "bye": p.bye_week} for p in state.roster(tid)]
             prior = self.priors.get(tid)
             teams.append({
                 "team_id": tid,
+                "name": meta.get("name") or f"Team {tid}",
+                "owner": meta.get("owner"),
+                "draft_slot": meta.get("draft_slot"),
                 "is_me": tid == self.my_team_id,
                 "archetype": prof.archetype,
                 "tendency": tendency_label(prof),
@@ -180,10 +197,15 @@ class DraftSession:
         return {
             "league_source": self.source,
             "num_teams": self.league.num_teams,
+            "starter_slots": self.league.starter_slots,
+            "scoring_type": self.league.scoring_type,
+            "is_superflex": self.league.is_superflex,
             "my_team_id": self.my_team_id,
             "current_overall": state.current_overall,
+            "current_round": (state.current_overall - 1) // self.league.num_teams + 1,
             "on_the_clock": self.on_the_clock_team(),
             "is_my_turn": self.is_my_turn(),
+            "active_runs": active_runs(state),
             "teams": teams,
         }
 
