@@ -49,7 +49,9 @@ class PickIn(BaseModel):
     position: str | None = None
     team: str | None = None          # NFL team abbrev (for D/ST matching)
     team_id: int | None = None       # ESPN fantasy team id; inferred if omitted
-    overall: int | None = None       # inferred (next pick) if omitted
+    overall: int | None = None       # inferred if omitted (from round/pick, else next)
+    round: int | None = None         # draft round (DOM capture provides this)
+    pick_in_round: int | None = None # pick within the round
     source: str = "websocket"
     use_llm: bool = True
 
@@ -132,7 +134,7 @@ def add_pick(pick: PickIn):
     result = s.ingest_pick(
         espn_id=pick.espn_id, name=pick.name, position=pick.position,
         team=pick.team, team_id=pick.team_id, overall=pick.overall,
-        source=pick.source,
+        round=pick.round, pick_in_round=pick.pick_in_round, source=pick.source,
     )
     # Recompute for whoever is now on the clock; pre-computes my pick the
     # instant the pick before mine lands.

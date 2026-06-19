@@ -98,9 +98,16 @@ class DraftSession:
         self._persist_pick(overall, team_id, player_id, source)
 
     def ingest_pick(self, espn_id=None, name=None, position=None, team=None,
-                    team_id=None, overall=None, source="websocket") -> dict:
-        """Resolve a captured pick to a player + slot it into the draft."""
+                    team_id=None, overall=None, round=None, pick_in_round=None,
+                    source="websocket") -> dict:
+        """Resolve a captured pick to a player + slot it into the draft.
+
+        Overall precedence: explicit > derived from round/pick (authoritative,
+        straight off the ESPN row) > next sequential. Deriving from round/pick
+        keeps picks correctly ordered even if the DOM emits them out of order."""
         pid, confidence = self.matcher.match(espn_id, name, position, team)
+        if overall is None and round and pick_in_round:
+            overall = (round - 1) * self.league.num_teams + pick_in_round
         if overall is None:
             overall = self.next_overall()
         if team_id is None:

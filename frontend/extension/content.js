@@ -13,11 +13,10 @@
   "use strict";
 
   const state = {
-    seenOveralls: new Set(),
+    seenKeys: new Set(),
     lastRecommendation: null,
     calibrate: false,
     useLlm: true,
-    overall: 0, // running count we've sent
   };
 
   // ---- config (selectors overridable from storage) ----------------------
@@ -105,22 +104,43 @@
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
   function maybePickFromRow(row) {
-    const text = (row.textContent || "").trim();
+    const text = (row.textContent || "").replace(/\s+/g, " ").trim();
     if (!text) return;
     if (state.calibrate) log("dom pick row", text);
-    // Heuristic: a pick row usually contains the player name; we send the name
-    // and let the server's matcher resolve it. Overall is inferred server-side.
-    const name = extractPlayerName(row, text);
-    if (name) handlePick({ name: name }, "dom");
+    const pick = parseDomPick(text);
+    if (pick) handlePick(pick, "dom");
+    else if (state.calibrate) log("  (skipped: not a completed pick row)");
   }
 
-  function extractPlayerName(row, text) {
-    // Prefer an explicit player-name element if present.
-    const el = row.querySelector("[class*='playerName'], [class*='player-name'], a[href*='playerId']");
-    if (el && el.textContent.trim()) return el.textContent.trim();
-    // Otherwise take the first line of text as a guess.
-    const firstLine = text.split("\n").map((s) => s.trim()).filter(Boolean)[0];
-    return firstLine || null;
+  // ESPN renders a COMPLETED pick row as:
+  //   "<Player> / <NFLTeam> <POS>R<round>, P<pickInRound> - <ManagerTeam>"
+  //   e.g. "Dallas Goedert / PHI TER7, P8 - 4th and Hurts"
+  // Header/upcoming cells ("Round 9", "PICK 114 AUTO …") have no " / " and are
+  // skipped. We send name + position + round/pick; the server computes the exact
+  // overall from round/pick (so ordering and dedup are reliable).
+  function parseDomPick(text) {
+    if (/^round\s*\d+/i.test(text)) return null;   // round header
+    if (/^pick\s*\d+/i.test(text)) return null;    // upcoming/auto cell
+    const i = text.indexOf(" / ");
+    if (i === -1) return null;                      // completed picks have " / "
+    const name = text.slice(0, i).trim();
+    if (!name) return null;
+    const rest = text.slice(i + 3);                 // "PHI TER7, P8 - Manager"
+    const m = rest.match(/^([A-Za-z]{2,4})\s+([A-Z/]+?)R(\d+),\s*P(\d+)/);
+    const out = { name: name };
+    if (m) {
+      out.position = normPos(m[2]);
+      out.round = parseInt(m[3], 10);
+      out.pick_in_round = parseInt(m[4], 10);
+    }
+    return out;
+  }
+
+  function normPos(p) {
+    p = (p || "").toUpperCase();
+    if (p === "D/ST" || p === "DST" || p === "DEF") return "DEF";
+    if (p === "PK") return "K";
+    return p;
   }
 
   // ---- turn detection ----------------------------------------------------
@@ -145,11 +165,13 @@
   }
 
   async function handlePick(pick, source) {
-    // Dedupe when we have an overall; otherwise rely on the server's ordering.
-    if (pick.overall != null) {
-      if (state.seenOveralls.has(pick.overall)) return;
-      state.seenOveralls.add(pick.overall);
-    }
+    // Dedupe on the most specific id available (round/pick, then overall, then
+    // name) — the DOM observer can re-emit the same row on re-render.
+    const key = (pick.round != null && pick.pick_in_round != null)
+      ? `r${pick.round}p${pick.pick_in_round}`
+      : (pick.overall != null ? `o${pick.overall}` : `n:${pick.name}`);
+    if (state.seenKeys.has(key)) return;
+    state.seenKeys.add(key);
     pick.source = source;
     pick.use_llm = state.useLlm;
     const res = await send("pick", { pick });
