@@ -36,8 +36,11 @@ _INSTRUCTIONS = (
     "the draft, weighing, in order:\n"
     "1. VALUE — take the best player available; a clear VORP edge wins unless a "
     "specific reason below overrides it.\n"
-    "2. ROSTER FIT — favor players who fill a starting slot the user still needs; "
-    "discount luxury depth at positions already set.\n"
+    "2. ROSTER FIT — weigh the SKILL already on the user's roster (shown per "
+    "position with VORP), not just which slots are filled: favor open starting "
+    "slots and genuine upgrades (a player who beats the user's current starter "
+    "there), and discount adding depth to a position the user is already strong "
+    "at.\n"
     "3. TIMING — only reach past higher value when a player likely will NOT "
     "return: weigh his survival probability AND who actually picks before the "
     "user's next turn (their needs/tendencies), not just that a position is "
@@ -77,6 +80,23 @@ def _static_board_text(session: DraftSession) -> str:
     return "\n".join(lines)
 
 
+def _my_roster_by_strength(session: DraftSession, team: dict) -> str:
+    """My roster grouped by position, each player with VORP, strongest first —
+    so the model can read the SKILL I hold at each spot, not just the count."""
+    state = session.build_state()
+    by_pos: dict[str, list] = {}
+    for pl in state.roster(session.my_team_id):
+        by_pos.setdefault(pl.position, []).append(pl)
+    out = []
+    for pos in ("QB", "RB", "WR", "TE", "K", "DEF"):
+        ps = sorted(by_pos.get(pos, []), key=lambda x: (x.vorp or -1e9), reverse=True)
+        if ps:
+            out.append(f"{pos}: " + ", ".join(
+                f"{p.name} {p.vorp:.0f}" if p.vorp is not None else p.name
+                for p in ps))
+    return " | ".join(out)
+
+
 def _situation_text(session: DraftSession, rec: Recommendation) -> str:
     summary = session.state_summary()
     lines = [
@@ -87,7 +107,13 @@ def _situation_text(session: DraftSession, rec: Recommendation) -> str:
     ]
     for t in summary["teams"]:
         me = " [YOU]" if t["is_me"] else ""
-        roster = ", ".join(f"{r['name']}({r['pos']})" for r in t["roster"]) or "empty"
+        if t["is_me"]:
+            # Show MY roster grouped by position with each player's VORP, so the
+            # model can weigh the SKILL I already have (don't stack a position
+            # I'm strong at; upgrade a weak one).
+            roster = _my_roster_by_strength(session, t) or "empty"
+        else:
+            roster = ", ".join(f"{r['name']}({r['pos']})" for r in t["roster"]) or "empty"
         needs = ", ".join(f"{s}x{c}" for s, c in t["needs"].items()) or "full"
         run = f", {t['tendency']}" if t["tendency"] != "ADP-aligned" else ""
         # Historical prior, when seeded — most informative before this team has
@@ -103,16 +129,18 @@ def _situation_text(session: DraftSession, rec: Recommendation) -> str:
     lines.append("SHORTLIST (engine-ranked; pick from these):")
     lines.append("name | pos | team | VORP | tier | players_left_in_tier | "
                  "P(avail at your next pick) | #intervening_teams_needing_pos | "
-                 "scouting note")
+                 "roster_role (need=open starter / upgrade=beats my starter / "
+                 "depth) | scouting note")
     for c in rec.shortlist:
         enr = getattr(c.player, "enrichment", None) or {}
         note = ""
         if enr.get("note"):
             note = f"[{enr.get('flag', '?')}] {enr['note']}"
+        role = "need" if c.fills_need else ("upgrade" if c.is_upgrade else "depth")
         lines.append(
             f"  {c.player.name} | {c.player.position} | {c.player.team or '-'} | "
             f"{c.vorp:.0f} | T{c.tier} | {c.players_left_in_tier} left | "
-            f"{c.p_available_next:.0%} | {c.needed_by_intervening} | {note}"
+            f"{c.p_available_next:.0%} | {c.needed_by_intervening} | {role} | {note}"
         )
     lines.append("")
     lines.append("Engine's provisional pick + reasoning (improve on it if "

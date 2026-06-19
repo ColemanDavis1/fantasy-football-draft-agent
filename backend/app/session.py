@@ -76,16 +76,15 @@ class DraftSession:
         # authoritative ESPN config (mock/practice drafts, or a size mismatch).
         self.auto_size = self.league_id in (None, "MOCK")
 
-        # Live safety net (Phase 6): player_ids ESPN's board marks DRAFTED that
-        # we haven't ingested a pick for yet. Kept out of the shortlist so sync
-        # lag can't make us recommend an already-taken player. Not persisted —
-        # it's a transient mirror of the live UI. (Set before any build_state.)
+        # Cumulative memory of drafted players (never shrinks during a draft).
         self.live_drafted_ids: set[str] = set()
+        self.drafted_name_keys: set[str] = set()
 
         # picks: overall -> Pick. Load any already persisted for this league.
         self.picks: dict[int, Pick] = {}
         self._load_persisted_picks()
         self._infer_size_from_persisted()
+        self._rebuild_drafted_memory()
 
     def _adopt_size(self, n: int) -> None:
         """Set the live team count. If it differs from the current size, rebuild
@@ -231,6 +230,8 @@ class DraftSession:
         if team_id is None:
             team_id = team_id_for_overall(self.build_state(), overall)
         if pid is None or pid not in self.players_by_id:
+            if name:
+                self.remember_drafted(names=[name])
             # Occupy the slot with a placeholder so an unmatched pick (typically
             # a player not on our board) can't leave a hole that makes us look
             # behind ESPN. Don't overwrite a slot we've already resolved.
@@ -244,6 +245,7 @@ class DraftSession:
             return {"ok": False, "reason": "unmatched", "overall": overall,
                     "recorded": recorded, "name": name, "confidence": confidence}
         self.add_pick(overall, int(team_id), pid, source)
+        self.live_drafted_ids.add(pid)
         return {"ok": True, "overall": overall, "team_id": int(team_id),
                 "player_id": pid, "player_name": self.players_by_id[pid].name,
                 "confidence": confidence}
@@ -301,36 +303,81 @@ class DraftSession:
     def next_overall(self) -> int:
         return (max(self.picks) + 1) if self.picks else 1
 
+    def _resolve_placeholder_id(self, player_id: str) -> str | None:
+        """Map a __unmatched__ placeholder back to a real player id."""
+        if not _is_unmatched(player_id):
+            return player_id if player_id in self.players_by_id else None
+        suffix = player_id[len(_UNMATCHED_PREFIX):]
+        if suffix.isdigit():
+            pid, _ = self.matcher.match(espn_id=suffix)
+        else:
+            pid, _ = self.matcher.match(name=suffix)
+        return pid if pid in self.players_by_id else None
+
+    def _rebuild_drafted_memory(self) -> None:
+        """Rebuild cumulative drafted memory from persisted picks."""
+        for p in self.picks.values():
+            if not _is_unmatched(p.player_id):
+                if p.player_id in self.players_by_id:
+                    self.live_drafted_ids.add(p.player_id)
+            else:
+                pid = self._resolve_placeholder_id(p.player_id)
+                if pid:
+                    self.live_drafted_ids.add(pid)
+                else:
+                    suffix = p.player_id[len(_UNMATCHED_PREFIX):]
+                    if suffix and not suffix.isdigit():
+                        self.drafted_name_keys.add(normalize_name(suffix))
+
+    def remember_drafted(self, espn_ids: list[str] | None = None,
+                         names: list[str] | None = None) -> int:
+        """Add drafted players to cumulative memory (merge, never replace)."""
+        added = 0
+        for eid in (espn_ids or []):
+            pid, _ = self.matcher.match(espn_id=str(eid))
+            if pid in self.players_by_id and pid not in self.live_drafted_ids:
+                self.live_drafted_ids.add(pid)
+                added += 1
+        for name in (names or []):
+            if not name:
+                continue
+            pid, _ = self.matcher.match(name=name)
+            if pid in self.players_by_id:
+                if pid not in self.live_drafted_ids:
+                    self.live_drafted_ids.add(pid)
+                    added += 1
+            else:
+                nk = normalize_name(name)
+                if nk and nk not in self.drafted_name_keys:
+                    self.drafted_name_keys.add(nk)
+                    added += 1
+        return added
+
     def build_state(self) -> DraftState:
         ordered = [self.picks[o] for o in sorted(self.picks)]
-        # Don't let the live-drafted safety net hide a player we've recorded a
-        # pick for (the recorded pick is authoritative for rosters).
-        recorded = {p.player_id for p in ordered}
+        recorded = {p.player_id for p in ordered
+                      if not _is_unmatched(p.player_id)}
+        excluded = set(self.live_drafted_ids)
+        for p in ordered:
+            if _is_unmatched(p.player_id):
+                pid = self._resolve_placeholder_id(p.player_id)
+                if pid:
+                    excluded.add(pid)
         return DraftState(
             league=self.league,
             draft_order=self.draft_order,
             picks=ordered,
             my_team_id=self.my_team_id if self.my_team_id is not None else -1,
             players_by_id=self.players_by_id,
-            extra_drafted_ids=self.live_drafted_ids - recorded,
+            extra_drafted_ids=excluded - recorded,
+            extra_drafted_names=set(self.drafted_name_keys),
         )
 
     # ---- live draft-room context ---------------------------------------
     def set_live_drafted(self, espn_ids: list[str] | None = None,
                          names: list[str] | None = None) -> int:
-        """Mirror ESPN's DRAFTED board into a safety-net set. Maps each ESPN id
-        or player name to our player id; unmapped entries are ignored."""
-        ids: set[str] = set()
-        for eid in (espn_ids or []):
-            pid, _ = self.matcher.match(espn_id=str(eid))
-            if pid in self.players_by_id:
-                ids.add(pid)
-        for name in (names or []):
-            pid, _ = self.matcher.match(name=name)
-            if pid in self.players_by_id:
-                ids.add(pid)
-        self.live_drafted_ids = ids
-        return len(ids)
+        """Merge ESPN's DRAFTED board into cumulative drafted memory."""
+        return self.remember_drafted(espn_ids=espn_ids, names=names)
 
     def _match_team_by_name(self, name: str) -> int | None:
         """Fuzzy-match a draft-room display string to a known team_id by
@@ -403,6 +450,19 @@ class DraftSession:
         if self.league_id:
             self.conn.commit()
 
+    def clear_all_picks(self) -> None:
+        """Wipe picks + drafted memory for a fresh draft."""
+        self.picks.clear()
+        self.live_drafted_ids.clear()
+        self.drafted_name_keys.clear()
+        self._round1_max = 0
+        self._size_finalized = False
+        if self.league_id:
+            self.conn.execute(
+                "DELETE FROM picks WHERE league_id=? AND season=?",
+                (self.league_id, self.season))
+            self.conn.commit()
+
     def apply_live_context(self, on_clock_name: str | None = None,
                            on_clock_overall: int | None = None,
                            teams: list[dict] | None = None,
@@ -411,7 +471,9 @@ class DraftSession:
                            my_name: str | None = None,
                            my_next_overall: int | None = None,
                            my_pick_overall: int | None = None,
-                           num_teams: int | None = None) -> dict:
+                           num_teams: int | None = None,
+                           my_first_pick_in_round: int | None = None,
+                           pre_draft: bool = False) -> dict:
         """Reconcile live draft-room identity against saved config.
 
         Identity is anchored to my DRAFT SLOT, learned from the room itself, so
@@ -443,6 +505,10 @@ class DraftSession:
         new_slot = None
         if my_pick_overall is not None:
             new_slot = slot_index_for_overall(int(my_pick_overall), n)
+        elif my_first_pick_in_round is not None and pre_draft:
+            # Pre-draft: "Round 1, Pick 6" → slot index 5, first overall is 6.
+            new_slot = int(my_first_pick_in_round) - 1
+            result["my_next_overall"] = int(my_first_pick_in_round)
         elif my_next_overall is not None:
             new_slot = slot_index_for_overall(int(my_next_overall), n)
             result["my_next_overall"] = int(my_next_overall)
@@ -482,6 +548,26 @@ class DraftSession:
             rec = self.recommend()
             result["my_next_overall"] = rec.my_next_overall
         return result
+
+    def ensure_pick_count(self, expected_overall: int, max_gap: int = 3) -> int:
+        """Fill missing overall slots with placeholders so pick count tracks ESPN
+        when capture lags by a few picks. Only runs for small gaps."""
+        if not expected_overall or expected_overall <= 1:
+            return 0
+        behind = expected_overall - self.build_state().current_overall
+        if behind <= 0 or behind > max_gap:
+            return 0
+        filled = 0
+        for o in range(1, expected_overall):
+            if o in self.picks:
+                continue
+            try:
+                tid = team_id_for_overall(self.build_state(), o)
+            except (IndexError, ValueError):
+                tid = self.draft_order[(o - 1) % self.league.num_teams]
+            self.add_pick(o, int(tid), f"{_UNMATCHED_PREFIX}gap_{o}", "gap-fill")
+            filled += 1
+        return filled
 
     def on_the_clock_team(self) -> int | None:
         state = self.build_state()
@@ -585,6 +671,7 @@ def _cand_to_dict(c) -> dict:
         "needed_by_intervening": c.needed_by_intervening,
         "roster_fit": c.roster_fit,
         "fills_need": c.fills_need,
+        "is_upgrade": c.is_upgrade,
         "tier_dropoff": c.tier_dropoff,
         "run_active": c.run_active,
         "run_count": c.run_count,

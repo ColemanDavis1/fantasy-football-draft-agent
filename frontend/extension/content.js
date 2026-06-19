@@ -12,18 +12,23 @@
     calibrate: false,
     useLlm: true,
     expectedOverall: null,
+    currentRound: null,
     myNextOverall: null,     // parsed from ESPN ("on the clock in: 1 pick")
     myPickOverall: null,     // overall I'm picking RIGHT NOW (set while my turn)
     onClockName: null,
     myName: null,            // popup config or auto-detected roster name
     liveContext: null,       // {pick_order, teams, my_team_id} from react
-    draftedEspnIds: [],      // ESPN board "DRAFTED" safety net
+    draftedEspnIds: [],
+    rememberedNames: new Set(),
+    rememberedEspnIds: new Set(),
     numTeams: null,          // live league size observed from the picks
     r1max: 0,                // max pick_in_round seen in round 1
     sawR2: false,            // a round-2 pick has appeared (round 1 is complete)
     lastPickCount: 0,
     lastMaxOverall: 0,
     lastContextKey: null,    // dedup live-context POSTs
+    preDraft: false,
+    newDraftStarted: false,
   };
 
   const SELECTORS = {
@@ -38,7 +43,11 @@
     state.myName = (cfg.myName || "").trim() || null;
     if (cfg.selectors) Object.assign(SELECTORS, cfg.selectors);
     log("content script ready", SELECTORS);
-    bootstrapScan();
+    chrome.storage.session.get(["draftedNames", "draftedEspnIds"], (mem) => {
+      (mem.draftedNames || []).forEach((n) => state.rememberedNames.add(n));
+      (mem.draftedEspnIds || []).forEach((id) => state.rememberedEspnIds.add(id));
+      bootstrapScan();
+    });
   });
 
   function log(...args) {
@@ -59,6 +68,17 @@
     if (m.kind === "ws") handleCapture(Object.assign({ transport: "ws" }, m.payload));
   });
 
+  function clearPreDraftIfActive() {
+    if (!state.preDraft) return false;
+    const hay = (document.body.innerText || "").replace(/\s+/g, " ");
+    if (/on\s+the\s+clock:?\s*pick\s*\d+/i.test(hay)) { state.preDraft = false; return true; }
+    if (/you are on the clock/i.test(hay)) { state.preDraft = false; return true; }
+    const rm = hay.match(/round\s+(\d+)\s+of\s+\d+/i);
+    if (rm && parseInt(rm[1], 10) > 1) { state.preDraft = false; return true; }
+    if (state.expectedOverall && state.expectedOverall > 1) { state.preDraft = false; return true; }
+    return false;
+  }
+
   function handleCapture(p) {
     if (!p) return;
 
@@ -67,12 +87,38 @@
     }
 
     if (p.event === "clock") {
-      if (p.current_overall) state.expectedOverall = p.current_overall;
+      if (p.pre_draft && !clearPreDraftIfActive()) {
+        state.preDraft = true;
+        state.expectedOverall = p.current_overall || 1;
+        if (p.my_next_overall) state.myNextOverall = p.my_next_overall;
+        if (p.my_first_pick_in_round && !state.myNextOverall) {
+          state.myNextOverall = p.my_first_pick_in_round;
+        }
+        ensureNewDraft();
+      } else {
+        state.preDraft = false;
+        if (p.current_overall) state.expectedOverall = p.current_overall;
+        if (p.current_round) state.currentRound = p.current_round;
+      }
       if (p.on_clock_name) state.onClockName = p.on_clock_name;
-      if (p.my_next_overall) state.myNextOverall = p.my_next_overall;
-      if (p.my_roster_name && !state.myName) state.myName = p.my_roster_name;
+      if (p.my_roster_name) {
+        if (!state.myName) state.myName = p.my_roster_name;
+      }
+      if (p.my_pick_overall) {
+        state.myPickOverall = p.my_pick_overall;
+        state.myNextOverall = null;
+      } else if (p.my_next_overall && !p.pre_draft) {
+        state.myNextOverall = p.my_next_overall;
+        state.myPickOverall = null;
+      }
       postLiveContext();
+      checkOnClock();
       return;
+    }
+
+    if (p.event === "picks" && state.preDraft) {
+      clearPreDraftIfActive();
+      if (state.preDraft) return;  // ignore stale react picks before draft starts
     }
 
     if (p.event === "context" && p.context) {
@@ -137,11 +183,12 @@
       const key = pick.overall != null ? `o${pick.overall}` : null;
       if (key) state.seenKeys.add(key);
     }
+    rememberDrafted(null, null, sorted);
     const res = await send("syncPicks", {
       picks: sorted, useLlm: state.useLlm,
       expectedOverall: state.expectedOverall,
-      draftedEspnIds: scrapeDraftedEspnIds(),
-      draftedNames: scrapeDraftedNames(),
+      draftedEspnIds: allDraftedEspnIds(),
+      draftedNames: allDraftedNames(),
     });
     if (!res || !res.ok) {
       for (const pick of sorted) {
@@ -165,19 +212,21 @@
       on_clock_overall: state.expectedOverall,
       my_pick_overall: state.myPickOverall,   // set only while it's my turn
       my_next_overall: state.myNextOverall,
+      pre_draft: state.preDraft,
+      my_first_pick_in_round: state.preDraft ? state.myNextOverall : null,
       num_teams: state.numTeams || (ctx.pick_order && ctx.pick_order.length)
         || (ctx.teams && ctx.teams.length) || null,
       teams: ctx.teams || null,
       pick_order: ctx.pick_order || null,
       my_team_id: ctx.my_team_id != null ? ctx.my_team_id : null,
       my_name: state.myName,
-      drafted_espn_ids: scrapeDraftedEspnIds(),
-      drafted_names: scrapeDraftedNames(),
+      drafted_espn_ids: allDraftedEspnIds(),
+      drafted_names: allDraftedNames(),
       use_llm: state.useLlm,
     };
     const key = JSON.stringify([payload.on_clock_name, payload.on_clock_overall,
       payload.my_pick_overall, payload.my_next_overall, payload.num_teams,
-      payload.pick_order, payload.my_team_id, payload.my_name]);
+      payload.pick_order, payload.my_team_id, payload.my_name, payload.pre_draft]);
     if (key === state.lastContextKey) return;  // nothing identity-relevant changed
     state.lastContextKey = key;
     const res = await send("liveContext", { context: payload });
@@ -187,19 +236,74 @@
     }
   }
 
-  // Best-effort: ESPN marks already-taken players DRAFTED on the player board.
+  async function ensureNewDraft() {
+    if (state.newDraftStarted) return;
+    state.newDraftStarted = true;
+    state.seenKeys.clear();
+    state.lastPickCount = 0;
+    state.lastMaxOverall = 0;
+    state.rememberedNames.clear();
+    state.rememberedEspnIds.clear();
+    chrome.storage.session.remove(["draftedNames", "draftedEspnIds"]);
+    const res = await send("newDraft");
+    if (res && res.ok) {
+      log("new draft — cleared stale picks", res.data);
+      if (res.data.recommendation) render(res.data.recommendation);
+    }
+  }
+
+  function persistDraftedMemory() {
+    chrome.storage.session.set({
+      draftedNames: [...state.rememberedNames],
+      draftedEspnIds: [...state.rememberedEspnIds],
+    });
+  }
+
+  function rememberDrafted(names, espnIds, picks) {
+    (names || []).forEach((n) => state.rememberedNames.add(n));
+    (espnIds || []).forEach((id) => state.rememberedEspnIds.add(String(id)));
+    (picks || []).forEach((p) => { if (p.name) state.rememberedNames.add(p.name); });
+    persistDraftedMemory();
+  }
+
+  function allDraftedNames() {
+    const names = new Set(state.rememberedNames);
+    scrapeDraftedNames().forEach((n) => names.add(n));
+    return [...names];
+  }
+
+  function allDraftedEspnIds() {
+    const ids = new Set(state.rememberedEspnIds);
+    scrapeDraftedEspnIds().forEach((id) => ids.add(id));
+    return [...ids];
+  }
+
+  function draftedQueryParams() {
+    const names = allDraftedNames();
+    const ids = allDraftedEspnIds();
+    const parts = [];
+    if (names.length) parts.push("drafted_names=" + encodeURIComponent(names.join("|")));
+    if (ids.length) parts.push("drafted_espn_ids=" + encodeURIComponent(ids.join("|")));
+    return parts.length ? "&" + parts.join("&") : "";
+  }
   // Pull their ESPN ids so the server keeps them out of the shortlist even if
   // their pick hasn't synced yet. Safe to return [] when nothing matches.
   // Names of players ESPN marks DRAFTED (fallback when espn id isn't in the DOM).
   function scrapeDraftedNames() {
-    const names = new Set();
-    document.querySelectorAll("[class*='player'], [class*='Player'], tr, li").forEach((row) => {
-      if (!/\bdrafted\b/i.test(row.textContent || "")) return;
-      const link = row.querySelector("a");
-      const text = ((link && link.textContent) || row.textContent || "")
+    const names = new Set(state.rememberedNames);
+    const rows = document.querySelectorAll(
+      "[class*='player'], [class*='Player'], tr, li, button");
+    rows.forEach((row) => {
+      const t = (row.textContent || "").replace(/\s+/g, " ");
+      const isDrafted = /\bdrafted\b/i.test(t)
+        || (row.matches && row.matches("button") && /drafted/i.test(t)
+            && (row.disabled || row.getAttribute("aria-disabled") === "true"));
+      if (!isDrafted) return;
+      const link = row.querySelector("a") || row.closest("[class*='player']")?.querySelector("a");
+      const text = ((link && link.textContent) || t)
         .replace(/\bdrafted\b/gi, "").replace(/\s+/g, " ").trim();
-      const m = text.match(/^([A-Za-z][A-Za-z .'\-]+)/);
-      if (m && m[1].length > 3) names.add(m[1].trim());
+      const m = text.match(/([A-Za-z][A-Za-z .'\-]{2,})/);
+      if (m) names.add(m[1].trim());
     });
     return [...names];
   }
@@ -239,13 +343,24 @@
     scanDom();
     readExpectedPickFromDom();
     setInterval(() => {
-      scanDom();
+      const prevPick = state.expectedOverall;
       readExpectedPickFromDom();
-      postLiveContext();
-    }, 3000);
+      clearPreDraftIfActive();
+      scanDom();
+      bootstrapTick = (bootstrapTick || 0) + 1;
+      if (state.expectedOverall !== prevPick || bootstrapTick % 3 === 0) {
+        state.lastContextKey = null;
+        postLiveContext();
+      }
+    }, 2000);
   }
+  let bootstrapTick = 0;
 
   function readExpectedPickFromDom() {
+    const hay = (document.body.innerText || "").replace(/\s+/g, " ");
+    const roundM = hay.match(/round\s+(\d+)\s+of\s+(\d+)/i);
+    if (roundM) state.currentRound = parseInt(roundM[1], 10);
+
     const el = document.querySelector(SELECTORS.onClock);
     const text = ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
     const m = text.match(/pick\s*[#:]?\s*(\d{1,3})\s+(.{1,40})$/i);
@@ -253,11 +368,16 @@
       state.expectedOverall = parseInt(m[1], 10);
       const name = (m[2] || "").trim();
       if (name) state.onClockName = name;
+      if (state.expectedOverall > 1) state.preDraft = false;
       return;
     }
     const m2 = text.match(/(?:pick)\s*[#:]?\s*(\d{1,3})\b/i)
-      || (document.body.innerText || "").match(/on\s+the\s+clock[^0-9]*pick\s*(\d{1,3})/i);
-    if (m2) state.expectedOverall = parseInt(m2[1], 10);
+      || hay.match(/on\s+the\s+clock:?\s*pick\s*(\d{1,3})/i);
+    if (m2) {
+      state.expectedOverall = parseInt(m2[1], 10);
+      if (state.expectedOverall > 1) state.preDraft = false;
+    }
+    if (/you are on the clock/i.test(hay)) state.preDraft = false;
   }
 
   function scanDom() {
@@ -318,6 +438,22 @@
     return null;
   }
 
+  function scrapeMyRoster() {
+    const players = [];
+    const blocks = document.querySelectorAll(
+      "[class*='roster'], [class*='Roster'], [class*='my-team'], [class*='myTeam']");
+    for (const block of blocks) {
+      block.querySelectorAll(
+        "[class*='player'], tr, li, [class*='athlete']").forEach((row) => {
+        const t = (row.textContent || "").replace(/\s+/g, " ").trim();
+        const m = t.match(/^([A-Z]\.?\s+[A-Za-z][A-Za-z .'\-]+|[A-Za-z][A-Za-z .'\-]{3,})\s+(QB|RB|WR|TE|K|DEF|D\/ST)/);
+        if (m) players.push({ name: m[1].trim(), position: normPos(m[2]) });
+      });
+      if (players.length) break;
+    }
+    return players;
+  }
+
   function normPos(p) {
     p = (p || "").toUpperCase();
     if (p === "D/ST" || p === "DST" || p === "DEF") return "DEF";
@@ -357,6 +493,8 @@
   // When true, the current overall IS my pick — the strongest identity signal,
   // so we hand it to the server to lock in my draft slot.
   function checkOnClock() {
+    readExpectedPickFromDom();
+    clearPreDraftIfActive();
     const el = document.querySelector(SELECTORS.onClock);
     const txt = ((el && el.textContent) || "").toLowerCase();
     const personal = /\byour pick\b|you'?re on the clock|make (your|the) pick|it'?s your turn|on the clock:?\s*you\b/.test(txt);
@@ -407,7 +545,11 @@
 
   async function refreshRecommendation() {
     const res = await send("recommendation", {
-      useLlm: state.useLlm, expectedOverall: state.expectedOverall });
+      useLlm: state.useLlm,
+      expectedOverall: state.expectedOverall,
+      draftedNames: allDraftedNames(),
+      draftedEspnIds: allDraftedEspnIds(),
+    });
     if (res && res.ok) render(res.data);
   }
 
@@ -437,6 +579,14 @@
     return root;
   }
 
+  function pickLabel(overall, numTeams, roundHint) {
+    if (!overall) return "";
+    const n = numTeams || state.numTeams || 12;
+    const rnd = roundHint || Math.floor((overall - 1) / n) + 1;
+    const pir = ((overall - 1) % n) + 1;
+    return `Round ${rnd}, Pick ${pir} (overall ${overall})`;
+  }
+
   function render(rec) {
     state.lastRecommendation = rec;
     const el = ensureOverlay();
@@ -444,12 +594,13 @@
 
     const caughtUp = isCaughtUp(rec);
     const espnPick = rec.expected_overall || state.expectedOverall;
+    const numTeams = rec.num_teams || state.numTeams || 12;
     const sync = el.querySelector("#ffda-sync");
     if (caughtUp) {
       sync.textContent = "● synced";
       sync.className = "ffda-ok";
     } else if (espnPick) {
-      sync.textContent = `● syncing — ESPN pick ${espnPick} (${rec.current_overall}/${espnPick})`;
+      sync.textContent = `● syncing — ${pickLabel(espnPick, numTeams, state.currentRound)} (${rec.current_overall}/${espnPick})`;
       sync.className = "ffda-warn";
     } else {
       sync.textContent = `● ${(rec.sync && rec.sync.missing_overalls || []).length} missing`;
@@ -458,19 +609,31 @@
 
     const name = rec.llm ? rec.llm.pick_name : (rec.primary && rec.primary.name);
     const rationale = rec.llm ? rec.llm.rationale : rec.engine_rationale;
-    // Only assert the turn once the server confirms we're synced — never from
-    // a stale pick count that's still catching up to ESPN.
+    const nextPick = rec.my_next_overall || state.myNextOverall;
+    const currentLabel = pickLabel(
+      espnPick || rec.current_overall, numTeams, state.currentRound);
+
     let turn;
-    if (!caughtUp && espnPick) {
-      turn = `Syncing — ESPN pick ${espnPick}, catching up (${rec.current_overall}/${espnPick})…`;
-    } else if (rec.is_my_turn) {
-      turn = "YOU ARE ON THE CLOCK";
+    if (state.preDraft) {
+      turn = `Pre-draft — your first pick: Round 1, Pick ${state.myNextOverall || "?"}`;
+    } else if (!caughtUp && espnPick) {
+      turn = `Syncing — ${currentLabel}, catching up (${rec.current_overall}/${espnPick})…`;
+    } else if (rec.is_my_turn || state.myPickOverall) {
+      const cur = state.myPickOverall || rec.current_overall;
+      turn = `YOU ARE ON THE CLOCK — ${pickLabel(cur, numTeams, state.currentRound)}`;
     } else {
-      // Prefer the server's value: it's derived from my observed draft slot and
-      // self-corrects, vs the DOM parse which can mis-read.
-      const nextPick = rec.my_next_overall || state.myNextOverall;
-      turn = `Pick ${rec.current_overall} · your next: ${nextPick || "?"}`;
+      const slot = rec.my_slot ? ` (slot ${rec.my_slot})` : "";
+      const nextLabel = nextPick
+        ? pickLabel(nextPick, numTeams)
+        : "?";
+      turn = `${currentLabel} · your next: ${nextLabel}${slot}`;
     }
+
+    const myRoster = scrapeMyRoster();
+    const rosterLine = myRoster.length
+      ? `<div id="ffda-roster">Your picks: ${myRoster.map(
+          (p) => esc(p.name) + " " + esc(p.position)).join(" · ")}</div>`
+      : "";
 
     const rows = (rec.shortlist || []).map((c) => `
       <tr>
@@ -481,9 +644,10 @@
         <td>${Math.round((c.p_available_next || 0) * 100)}%</td>
       </tr>`).join("");
 
-    const showRec = caughtUp;
+    const showRec = state.preDraft || caughtUp || !!state.myPickOverall;
     el.querySelector("#ffda-body").innerHTML = `
       <div id="ffda-turn">${esc(turn)}</div>
+      ${rosterLine}
       ${showRec && name ? `<div id="ffda-primary"><b>Take ${esc(name)}</b>
         ${rec.llm ? '<span class="ffda-badge">AI</span>' : ''}</div>
         <div id="ffda-rationale">${esc(rationale || "")}</div>` : ""}

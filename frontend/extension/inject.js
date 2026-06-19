@@ -163,6 +163,7 @@
   }
 
   function scanReact() {
+    const preDraft = detectPreDraft();
     // Union picks from EVERY pick-bearing structure in the tree, not just the
     // single largest array. ESPN spreads the board across a full-history list
     // and smaller recent-picks widgets; taking only the biggest dropped the
@@ -213,46 +214,72 @@
 
     const picks = [...merged.values()].sort(
       (a, b) => (a.overall || 0) - (b.overall || 0));
-    if (picks.length) forward({ event: "picks", source: "react", picks: picks });
+    if (!preDraft && picks.length) {
+      forward({ event: "picks", source: "react", picks: picks });
+    }
 
     if (context.pick_order || context.teams || context.my_team_id != null) {
       forward({ event: "context", context: context });
     }
 
-    const clock = readCurrentPickFromDom();
-    const myNext = readMyNextPickFromDom(clock.overall);
-    const myName = detectMyRosterName();
-    if (clock.overall || clock.name || myNext || myName) {
+    const clock = readCurrentPickFromDom(preDraft);
+    const rosterName = detectMyRosterName();
+    const firstPick = preDraft ? readMyFirstPickFromDom() : null;
+    const myOnClock = !preDraft && clock.overall && clock.name && rosterName
+      && namesMatch(clock.name, rosterName);
+    const myNext = preDraft ? (firstPick && firstPick.overall) : (
+      myOnClock ? null : readMyNextPickFromDom(clock.overall, rosterName));
+    const myPick = myOnClock ? clock.overall : null;
+
+    if (clock.overall || clock.name || myNext || myPick || rosterName || preDraft) {
       forward({ event: "clock", current_overall: clock.overall,
+                current_round: clock.round,
                 on_clock_name: clock.name, my_next_overall: myNext,
-                my_roster_name: myName });
+                my_pick_overall: myPick, my_roster_name: rosterName,
+                pre_draft: preDraft,
+                my_first_round: firstPick && firstPick.round,
+                my_first_pick_in_round: firstPick && firstPick.pick_in_round });
     }
 
-    const domPicks = scanPickHistoryText();
+    if (preDraft) return;  // no completed picks yet — skip all pick scraping
+
+    const domMerged = new Map();
+    for (const p of scanPickHistoryText().concat(scanDraftBoardStrip())) {
+      const key = p.overall != null ? "o" + p.overall
+        : (p.round != null ? "r" + p.round + "p" + p.pick_in_round : "n" + p.name);
+      domMerged.set(key, p);
+    }
+    const domPicks = [...domMerged.values()];
     if (domPicks.length) {
       forward({ event: "picks", source: "dom-scan", picks: domPicks });
     }
   }
 
+  function namesMatch(a, b) {
+    const na = String(a || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const nb = String(b || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    return na.length >= 2 && nb.length >= 2 && (na.includes(nb) || nb.includes(na));
+  }
+
   // ESPN shows "on the clock in: 1 Pick" — derive my next overall from that.
-  function readMyNextPickFromDom(currentOverall) {
+  function readMyNextPickFromDom(currentOverall, rosterName) {
     const hay = (document.body.innerText || "").replace(/\s+/g, " ");
     const m = hay.match(/on the clock in:\s*(\d+)\s*pick/i);
     if (m && currentOverall) {
       return currentOverall + parseInt(m[1], 10);
     }
-    // Highlighted upcoming cell in the draft strip (often green).
-    const cells = document.querySelectorAll(
-      "[class*='pick'], [class*='Pick'], [class*='draft'], td, li, div");
-    for (const el of cells) {
-      const cls = String(el.className || "");
-      if (!/active|selected|current|upcoming|my|next|highlight|onclock/i.test(cls)) {
-        continue;
-      }
-      const text = (el.textContent || "").replace(/\s+/g, " ").trim();
-      const pm = text.match(/(?:pick\s*)?(\d{1,3})\b/i);
-      if (pm && parseInt(pm[1], 10) > (currentOverall || 0)) {
-        return parseInt(pm[1], 10);
+    // Draft strip: find cell with my name that's an upcoming pick (not on clock).
+    if (rosterName) {
+      const cells = document.querySelectorAll(
+        "[class*='pick'], [class*='Pick'], [class*='draft'], td, li, div, span");
+      for (const el of cells) {
+        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!namesMatch(text, rosterName)) continue;
+        const pm = text.match(/\b(\d{1,3})\b/);
+        if (pm) {
+          const n = parseInt(pm[1], 10);
+          if (n > (currentOverall || 0)) return n;
+        }
       }
     }
     return null;
@@ -346,24 +373,124 @@
     walk(root, 0);
   }
 
-  function readCurrentPickFromDom() {
-    // ESPN header: "ON THE CLOCK: PICK 25 Coleman"
+  function detectPreDraft() {
+    const hay = (document.body.innerText || "").replace(/\s+/g, " ");
+
+    // Draft is clearly underway — never treat as pre-draft.
+    if (/on\s+the\s+clock:?\s*pick\s*\d+/i.test(hay)) return false;
+    if (/you are on the clock/i.test(hay)) return false;
+    const roundOf = hay.match(/round\s+(\d+)\s+of\s+\d+/i);
+    if (roundOf && parseInt(roundOf[1], 10) > 1) return false;
+    const history = hay.match(/R\d+,\s*P\d+/gi);
+    if (history && history.length >= 2) return false;
+    const clockPick = readCurrentPickFromDom(false);
+    if (clockPick.overall && clockPick.overall > 1) return false;
+
+    // Pre-draft: countdown or "your first pick" before any clock banner.
+    if (/draft is about to start|drafting in|waiting for draft to begin/i.test(hay)) {
+      return true;
+    }
+    if (/your first pick:?\s*round\s*1/i.test(hay) && !/on\s+the\s+clock/i.test(hay)) {
+      return true;
+    }
+    // Empty rosters, no pick history, no clock yet.
+    if (!/on\s+the\s+clock/i.test(hay) && /empty/i.test(hay) && !/R\d+,\s*P\d+/i.test(hay)) {
+      return true;
+    }
+    return false;
+  }
+
+  function readMyFirstPickFromDom() {
+    const hay = (document.body.innerText || "").replace(/\s+/g, " ");
+    const m = hay.match(
+      /your first pick:?\s*round\s*(\d+),?\s*pick\s*(\d+)/i);
+    if (m) {
+      const round = parseInt(m[1], 10);
+      const pir = parseInt(m[2], 10);
+      return { round: round, pick_in_round: pir,
+               overall: round === 1 ? pir : null };
+    }
+    // Draft strip: highlighted cell "6 Coleman" before draft starts.
+    const rosterName = detectMyRosterName();
+    if (rosterName) {
+      const cells = document.querySelectorAll(
+        "[class*='pick'], [class*='Pick'], [class*='draft'], td, li, div, span");
+      for (const el of cells) {
+        const text = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!namesMatch(text, rosterName)) continue;
+        const pm = text.match(/^(\d{1,2})\s+/);
+        if (pm) {
+          const n = parseInt(pm[1], 10);
+          if (n >= 1 && n <= 20) return { round: 1, pick_in_round: n, overall: n };
+        }
+      }
+    }
+    return null;
+  }
+
+  function readCurrentPickFromDom(preDraft) {
+    const out = { overall: null, name: null, round: null };
+    const hay = (document.body.innerText || "").replace(/\s+/g, " ");
+    const roundM = hay.match(/round\s+(\d+)\s+of\s+(\d+)/i);
+    if (roundM) out.round = parseInt(roundM[1], 10);
+
+    // Strongest: "ON THE CLOCK: PICK 63 Coleman"
+    const om = hay.match(
+      /on\s+the\s+clock:?\s*pick\s*(\d{1,3})\s+([A-Za-z][A-Za-z\s.'-]{1,35})/i);
+    if (om) {
+      out.overall = parseInt(om[1], 10);
+      out.name = om[2].trim();
+      return out;
+    }
     const banner = document.querySelector(
       "[class*='onTheClock'], [class*='on-the-clock'], [class*='clock'], [class*='Clock']");
-    const out = { overall: null, name: null };
-    // Name only from the dedicated banner (body text is too noisy to trust).
     const bannerText = ((banner && banner.textContent) || "").replace(/\s+/g, " ").trim();
+    // Only trust banner text — never fall back to full body (picks up RK 93 etc).
     const bm = bannerText.match(/pick\s*[#:]?\s*(\d{1,3})\s+(.{1,40})$/i);
     if (bm) {
       out.overall = parseInt(bm[1], 10);
       out.name = (bm[2] || "").trim() || null;
-    }
-    if (out.overall == null) {
-      const hay = (bannerText || document.body.innerText || "").replace(/\s+/g, " ");
-      const m = hay.match(/(?:on\s+the\s+clock|pick)\s*[#:]?\s*(\d{1,3})\b/i);
+    } else {
+      const m = bannerText.match(/pick\s*[#:]?\s*(\d{1,3})\b/i);
       if (m) out.overall = parseInt(m[1], 10);
     }
+    if (preDraft && !out.overall) out.overall = 1;
     return out;
+  }
+
+  // Parse the horizontal draft-board cells (completed picks + upcoming AUTO cells).
+  function scanDraftBoardStrip() {
+    const merged = new Map();
+    const cells = document.querySelectorAll(
+      "[class*='pick'], [class*='Pick'], [class*='draft'], [class*='Draft'], "
+      + "td, li, [class*='cell'], [class*='slot']");
+    for (const cell of cells) {
+      const text = (cell.textContent || "").replace(/\s+/g, " ").trim();
+      if (!text || text.length > 160 || /\bAUTO\b/i.test(text)) continue;
+      // "23 Ja'Marr Chase WR" — require position suffix so we skip RK columns
+      let m = text.match(
+        /^(\d{1,3})\s+([A-Za-z][A-Za-z .'\-]+?)\s+(QB|RB|WR|TE|K|DEF|D\/ST)\s*$/);
+      if (!m) {
+        // "Ja'Marr Chase / CIN WR R1, P10" embedded in a cell
+        m = text.match(/([A-Za-z][A-Za-z .'\-]+?)\s+\/\s+([A-Z]{2,4})\s+([A-Z/]+?)R(\d+),\s*P(\d+)/);
+        if (m) {
+          const key = "r" + m[4] + "p" + m[5];
+          merged.set(key, {
+            name: m[1].trim(), team: m[2],
+            position: m[3].replace(/\/.*/, "").trim(),
+            round: parseInt(m[4], 10), pick_in_round: parseInt(m[5], 10),
+          });
+        }
+        continue;
+      }
+      const overall = parseInt(m[1], 10);
+      const name = m[2].trim();
+      if (name.length < 3 || /^(round|pick|auto|rd)$/i.test(name)) continue;
+      const out = { overall: overall, name: name };
+      if (m[3]) out.position = m[3];
+      merged.set("o" + overall, out);
+    }
+    return [...merged.values()];
   }
 
   // Poll React state — ESPN's draft room keeps the full pick list here even

@@ -37,6 +37,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         case "recommendation": {
           let path = "/recommendation?use_llm=" + (msg.useLlm ? "true" : "false");
           if (msg.expectedOverall) path += "&expected_overall=" + msg.expectedOverall;
+          if (msg.draftedNames && msg.draftedNames.length) {
+            path += "&drafted_names=" + encodeURIComponent(msg.draftedNames.join("|"));
+          }
+          if (msg.draftedEspnIds && msg.draftedEspnIds.length) {
+            path += "&drafted_espn_ids=" + encodeURIComponent(msg.draftedEspnIds.join("|"));
+          }
           sendResponse({ ok: true, data: await call(path) });
           break;
         }
@@ -48,6 +54,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           break;
         case "health":
           sendResponse({ ok: true, data: await call("/health") });
+          break;
+        case "newDraft":
+          sendResponse({ ok: true, data: await call("/session/new-draft", {
+            method: "POST",
+          }) });
           break;
         case "reset":
           sendResponse({ ok: true, data: await call("/session/reset", { method: "POST" }) });

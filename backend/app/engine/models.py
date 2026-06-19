@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..match import normalize_name
+
 
 @dataclass
 class Player:
@@ -48,6 +50,8 @@ class DraftState:
     # pick for yet (sync lag). Excluded from available() so a drafted player can
     # never surface in the shortlist even before his pick lands.
     extra_drafted_ids: set[str] = field(default_factory=set)
+    # Normalized full names we know are drafted but couldn't map to an id yet.
+    extra_drafted_names: set[str] = field(default_factory=set)
 
     @property
     def num_teams(self) -> int:
@@ -64,7 +68,15 @@ class DraftState:
 
     def available(self) -> list[Player]:
         drafted = self.drafted_ids | self.extra_drafted_ids
-        return [p for p in self.players_by_id.values() if p.player_id not in drafted]
+        blocked_names = self.extra_drafted_names
+        out: list[Player] = []
+        for p in self.players_by_id.values():
+            if p.player_id in drafted:
+                continue
+            if blocked_names and normalize_name(p.name) in blocked_names:
+                continue
+            out.append(p)
+        return out
 
     def roster_player_ids(self, team_id: int) -> list[str]:
         return [p.player_id for p in self.picks if p.team_id == team_id]
